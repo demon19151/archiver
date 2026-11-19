@@ -1,0 +1,18 @@
+node_modules/
+*.log
+.DS_Store
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+
+# Generated output and test artifacts
+coverage/
+dist/
+build/
+*.sarc
+*.sarb
+restored-files.zip

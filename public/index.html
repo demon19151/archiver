@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Архиватор файлов</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="container">
+    <div class="left-column">
+      <section class="block compress-block">
+        <h2>Сжатие файлов</h2>
+        <label class="drop-zone" id="compressDropZone">
+          <input id="compressInput" type="file" multiple hidden>
+          <div class="drop-content">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+            </svg>
+            <span class="drop-text">Перетащите файлы сюда</span>
+            <span class="drop-hint">или нажмите для выбора</span>
+          </div>
+        </label>
+        <div id="compressFileList" class="file-list" hidden></div>
+      </section>
+
+      <section class="block decompress-block">
+        <h2>Распаковка архива</h2>
+        <label class="drop-zone" id="decompressDropZone">
+          <input id="decompressInput" type="file" accept=".sarc,.sarb" multiple hidden>
+          <div class="drop-content">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+            </svg>
+            <span class="drop-text">Перетащите архив сюда</span>
+            <span class="drop-hint">или нажмите для выбора</span>
+          </div>
+        </label>
+        <div id="decompressFileList" class="file-list" hidden></div>
+      </section>
+    </div>
+
+    <aside class="right-panel">
+      <div id="idleState" class="panel-state">
+        <div class="idle-icon">
+          <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M20 7h-9M14 17H5M17 12l3-3-3-3M10 19l-3-3 3-3"/>
+          </svg>
+        </div>
+        <p class="idle-text">Загрузите файлы для сжатия или архив для распаковки</p>
+      </div>
+
+      <div id="compressState" class="panel-state" hidden>
+        <h3>Сжатие файлов</h3>
+        <div id="compressProgress" class="progress-info"></div>
+        <div id="compressStats" class="stats-block"></div>
+        <button id="compressButton" class="action-button" disabled>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+          </svg>
+          Сжать файлы
+        </button>
+        <button id="downloadCompressedButton" class="action-button secondary" hidden disabled>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+          </svg>
+          Скачать архив
+        </button>
+      </div>
+
+      <div id="decompressState" class="panel-state" hidden>
+        <h3>Распаковка архива</h3>
+        <div id="decompressProgress" class="progress-info"></div>
+        <div id="decompressStats" class="stats-block"></div>
+        <button id="decompressButton" class="action-button" disabled>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+          </svg>
+          Распаковать архив
+        </button>
+        <button id="downloadDecompressedButton" class="action-button secondary" hidden disabled>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+          </svg>
+          Скачать папку с файлами (.zip)
+        </button>
+      </div>
+    </aside>
+  </div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
