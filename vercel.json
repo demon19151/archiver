@@ -1,7 +1,14 @@
 {
-  "rewrites": [
-    { "source": "/v1/health", "destination": "/api/health" },
-    { "source": "/v1/compress", "destination": "/api/compress" },
-    { "source": "/v1/decompress", "destination": "/api/decompress" }
+  "version": 2,
+  "builds": [
+    { "src": "api/*.js", "use": "@vercel/node" },
+    { "src": "public/**", "use": "@vercel/static" }
+  ],
+  "routes": [
+    { "src": "/v1/health", "dest": "/api/health.js" },
+    { "src": "/v1/compress", "dest": "/api/compress.js" },
+    { "src": "/v1/decompress", "dest": "/api/decompress.js" },
+    { "handle": "filesystem" },
+    { "src": "/(.*)", "dest": "/public/$1" }
   ]
 }
