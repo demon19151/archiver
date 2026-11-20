@@ -15,7 +15,9 @@ function sendJson(response, status, value) {
     'Content-Length': body.length,
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Private-Network': 'true',
+    'Access-Control-Max-Age': '86400'
   });
   response.end(body);
 }
@@ -26,7 +28,9 @@ function sendBytes(response, body, contentType = 'application/octet-stream') {
     'Content-Length': body.length,
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Private-Network': 'true',
+    'Access-Control-Max-Age': '86400'
   });
   response.end(body);
 }
@@ -69,7 +73,9 @@ const server = createServer(async (request, response) => {
       response.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+        'Access-Control-Allow-Private-Network': 'true',
+        'Access-Control-Max-Age': '86400'
       });
       response.end();
       return;
