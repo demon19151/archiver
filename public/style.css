@@ -100,6 +100,10 @@ body {
 .drop-content svg {
   color: var(--accent);
   margin-bottom: 8px;
+  display: block;
+  flex: 0 0 auto;
+  align-self: center;
+  transform: translateX(0);
 }
 
 .drop-text {
@@ -217,6 +221,12 @@ body {
   gap: 20px;
 }
 
+.panel-state[hidden] {
+  display: none !important;
+}
+
+#decompressState:not([hidden]) { margin-top: 24px; }
+
 .panel-state h3 {
   font-size: 20px;
   font-weight: 600;
@@ -294,6 +304,7 @@ body {
   cursor: pointer;
   transition: all 0.2s;
   margin-top: auto;
+  flex-shrink: 0;
 }
 
 .action-button:hover:not(:disabled) {
@@ -311,8 +322,9 @@ body {
   background: var(--bg-primary);
   color: var(--text-primary);
   border: 1px solid var(--border);
-  margin-top: 12px;
+  margin-top: 14px;
 }
+
 
 .action-button.secondary:hover:not(:disabled) {
   background: var(--bg-hover);
