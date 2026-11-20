@@ -1,4 +1,4 @@
-const API_BASE = location.origin;
+import { runCodec } from './codec-client.js';
 
 // DOM elements
 const compressInput = document.getElementById('compressInput');
@@ -317,19 +317,10 @@ compressButton.addEventListener('click', async () => {
       compressProgress.textContent = `Сжатие файла ${i + 1} из ${selected.length}...\n${file.name}`;
       
       const data = await file.arrayBuffer();
-      const response = await fetch(`${API_BASE}/v1/compress`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: data
-      });
-      
-      if (!response.ok) {
-        const error = await response.json().catch(() => ({ error: { message: response.statusText } }));
-        throw new Error(error.error?.message || 'Ошибка сжатия');
-      }
-      
-      const compressed = await response.arrayBuffer();
-      results.push({ name: file.name, original: data.byteLength, compressed: compressed.byteLength, data: compressed });
+      const originalSize = data.byteLength;
+      const compressedResult = await runCodec('compress', data);
+      const compressed = compressedResult.buffer;
+      results.push({ name: file.name, original: originalSize, compressed: compressed.byteLength, data: compressed });
     }
     
     const totalOriginal = results.reduce((sum, r) => sum + r.original, 0);
@@ -418,35 +409,17 @@ decompressButton.addEventListener('click', async () => {
       if (isSARB(data)) {
         const entries = parseSARB(data);
         for (const entry of entries) {
-          const response = await fetch(`${API_BASE}/v1/decompress`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/octet-stream' },
-            body: entry.data
-          });
-          
-          if (!response.ok) {
-            const error = await response.json().catch(() => ({ error: { message: response.statusText } }));
-            throw new Error(error.error?.message || 'Ошибка распаковки');
-          }
-          
-          const decompressed = await response.arrayBuffer();
-          results.push({ name: entry.name, compressed: entry.data.byteLength, decompressed: decompressed.byteLength, data: decompressed });
+          const compressedSize = entry.data.byteLength;
+          const decompressedResult = await runCodec('decompress', entry.data);
+          const decompressed = decompressedResult.buffer;
+          results.push({ name: entry.name, compressed: compressedSize, decompressed: decompressed.byteLength, data: decompressed });
         }
       } else {
-        const response = await fetch(`${API_BASE}/v1/decompress`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body: data
-        });
-        
-        if (!response.ok) {
-          const error = await response.json().catch(() => ({ error: { message: response.statusText } }));
-          throw new Error(error.error?.message || 'Ошибка распаковки');
-        }
-        
-        const decompressed = await response.arrayBuffer();
+        const compressedSize = data.byteLength;
+        const decompressedResult = await runCodec('decompress', data);
+        const decompressed = decompressedResult.buffer;
         const name = file.name.replace(/\.(sarc|sarb)$/i, '');
-        results.push({ name, compressed: data.byteLength, decompressed: decompressed.byteLength, data: decompressed });
+        results.push({ name, compressed: compressedSize, decompressed: decompressed.byteLength, data: decompressed });
       }
     }
     

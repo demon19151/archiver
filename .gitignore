@@ -13,6 +13,7 @@ node_modules/
 coverage/
 dist/
 build/
+public/codec-worker.bundle.js
 *.sarc
 *.sarb
 restored-files.zip

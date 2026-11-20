@@ -2,13 +2,13 @@
   "version": 2,
   "builds": [
     { "src": "api/*.js", "use": "@vercel/node" },
-    { "src": "public/**", "use": "@vercel/static" }
+    { "src": "package.json", "use": "@vercel/static-build", "config": { "distDir": "dist" } }
   ],
   "routes": [
     { "src": "/v1/health", "dest": "/api/health.js" },
     { "src": "/v1/compress", "dest": "/api/compress.js" },
     { "src": "/v1/decompress", "dest": "/api/decompress.js" },
     { "handle": "filesystem" },
-    { "src": "/(.*)", "dest": "/public/$1" }
+    { "src": "/", "dest": "/index.html" }
   ]
 }
