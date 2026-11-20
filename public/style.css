@@ -228,7 +228,7 @@ body {
   background: var(--bg-block);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: 32px;
+  padding: 24px;
   display: flex;
   flex-direction: column;
   overflow-y: auto;
@@ -237,7 +237,7 @@ body {
 .panel-state {
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 12px;
 }
 
 .panel-state h3 {
@@ -249,7 +249,7 @@ body {
 .idle-icon {
   display: flex;
   justify-content: center;
-  margin: auto 0;
+  margin: 8px 0 0;
   opacity: 0.3;
 }
 
@@ -262,7 +262,7 @@ body {
   text-align: center;
   color: var(--text-secondary);
   font-size: 15px;
-  margin: 0 auto;
+  margin: 0 auto 8px;
   max-width: 300px;
 }
 
@@ -279,7 +279,7 @@ body {
 .stats-block {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 6px;
 }
 
 .stat-row {
@@ -321,7 +321,7 @@ body {
   font-weight: 600;
   cursor: pointer;
   transition: all 0.2s;
-  margin-top: auto;
+  margin-top: 4px;
 }
 
 .action-button:hover:not(:disabled) {
@@ -339,7 +339,16 @@ body {
   background: var(--bg-primary);
   color: var(--text-primary);
   border: 1px solid var(--border);
-  margin-top: 12px;
+  margin-top: 8px;
+}
+
+/* Keep the gap between the compression result and the next operation clear. */
+#compressState + #decompressState {
+  margin-top: 28px;
+}
+
+#compressState + #decompressState .panel-state {
+  gap: 12px;
 }
 
 .action-button.secondary:hover:not(:disabled) {
