@@ -57,6 +57,21 @@ test('incompressible binary has only small overhead', () => {
   assert.deepEqual(decompress(archive), input);
 });
 
+test('high-entropy multi-megabyte input takes the store path', () => {
+  const input = Buffer.alloc(2 * 1024 * 1024);
+  let state = 0x12345678;
+  for (let i = 0; i < input.length; i++) {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    input[i] = state & 0xff;
+  }
+  const archive = compress(input);
+  assert.equal(archive[0], 0xf0);
+  assert.equal(archive.length, input.length + 5);
+  assert.deepEqual(decompress(archive), input);
+});
+
 test('truncated archive is rejected', () => {
   const archive = compress(Buffer.from('hello'));
   assert.throws(() => decompress(archive.subarray(0, archive.length - 1)), error => error instanceof ArchiveError && ['invalid_archive', 'checksum_mismatch'].includes(error.code));

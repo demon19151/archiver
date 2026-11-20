@@ -522,20 +522,37 @@ function entropy(data) {
 
 function looksIncompressible(input) {
   if (input.length < 8192) return false;
-  const sample = input.subarray(0, Math.min(input.length, 8 * 1024));
-  if (entropy(sample) < 7.94) return false;
-  // For high-entropy data, repeated four-byte sequences indicate duplicated
-  // blocks and justify trying LZ. Random/encrypted/already-compressed samples
-  // have almost no exact quadgram repeats and can safely use store immediately.
-  const seen = new Set();
-  let repeats = 0;
-  for (let i = 0; i + 3 < sample.length; i++) {
-    const key = ((sample[i] * 0x1000000) + (sample[i + 1] << 16) + (sample[i + 2] << 8) + sample[i + 3]) >>> 0;
-    if (seen.has(key)) {
-      if (++repeats >= 3) return false;
-    } else seen.add(key);
+  // Sample several regions: multimedia containers often start with a simple
+  // header while their payload is already compressed. Avoid expensive full
+  // LZ/Huffman passes when most sampled payload regions have high entropy and
+  // almost no repeated quadgrams. Never use filename extensions for this.
+  const windowSize = Math.min(4096, input.length);
+  const starts = [...new Set([
+    0,
+    Math.max(0, Math.floor(input.length / 4) - Math.floor(windowSize / 2)),
+    Math.max(0, Math.floor(input.length / 2) - Math.floor(windowSize / 2)),
+    Math.max(0, Math.floor((input.length * 3) / 4) - Math.floor(windowSize / 2)),
+    Math.max(0, input.length - windowSize)
+  ])];
+  let incompressibleWindows = 0;
+  for (const start of starts) {
+    const sample = input.subarray(start, Math.min(input.length, start + windowSize));
+    // Encoded media often lands around 7.5–7.8 bits/byte: it is already
+    // compressed enough that a deep LZ search usually cannot repay its cost.
+    if (sample.length < 1024 || entropy(sample) < 7.5) continue;
+    const seen = new Set();
+    let repeatedQuadgrams = 0;
+    for (let i = 0; i + 3 < sample.length; i++) {
+      const key = ((sample[i] * 0x1000000) + (sample[i + 1] << 16) + (sample[i + 2] << 8) + sample[i + 3]) >>> 0;
+      if (seen.has(key)) {
+        if (++repeatedQuadgrams > 4) break;
+      } else {
+        seen.add(key);
+      }
+    }
+    if (repeatedQuadgrams <= 4) incompressibleWindows++;
   }
-  return true;
+  return incompressibleWindows >= Math.min(3, starts.length);
 }
 
 function shouldTryDelta(input) {
