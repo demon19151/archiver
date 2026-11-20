@@ -21,11 +21,8 @@ const compressProgress = document.getElementById('compressProgress');
 const compressStats = document.getElementById('compressStats');
 const decompressProgress = document.getElementById('decompressProgress');
 const decompressStats = document.getElementById('decompressStats');
-// Vercel function request bodies are limited to roughly 4.5 MB. Keep blocks
-// at 4 MiB to leave room for transport overhead, and process a small bounded
-// number concurrently to amortize serverless/network latency on large files.
-const CHUNK_SIZE = 4 * 1024 * 1024;
-const CHUNK_CONCURRENCY = 3;
+// Kept only to extract .sabl archives created by previous site versions.
+const LEGACY_CHUNK_CONCURRENCY = 3;
 
 // State
 let compressFiles = [];
@@ -331,26 +328,10 @@ compressButton.addEventListener('click', async () => {
   try {
     for (let i = 0; i < selected.length; i++) {
       const { file } = selected[i];
-      if (file.size > CHUNK_SIZE) {
-        const count = Math.ceil(file.size / CHUNK_SIZE);
-        let completed = 0;
-        const chunks = await mapWithConcurrency(count, CHUNK_CONCURRENCY, async chunkIndex => {
-          compressProgress.textContent = `Сжатие ${i + 1}/${selected.length}\n${file.name}: блоки ${completed}/${count}`;
-          const start = chunkIndex * CHUNK_SIZE;
-          const bytes = await file.slice(start, Math.min(start + CHUNK_SIZE, file.size)).arrayBuffer();
-          const archiveChunk = await postBinary('/v1/compress', bytes, `Ошибка сжатия блока ${chunkIndex + 1}`, true);
-          completed++;
-          compressProgress.textContent = `Сжатие ${i + 1}/${selected.length}\n${file.name}: блоки ${completed}/${count}`;
-          return archiveChunk;
-        });
-        const archive = createChunkedArchive(file.name, file.size, chunks);
-        results.push({ name: file.name, archiveName: `${file.name}.sabl`, original: file.size, compressed: archive.byteLength, data: archive });
-      } else {
-        compressProgress.textContent = `Сжатие файла ${i + 1} из ${selected.length}...\n${file.name}`;
-        const data = await file.arrayBuffer();
-        const compressed = await postBinary('/v1/compress', data, 'Ошибка сжатия');
-        results.push({ name: file.name, original: data.byteLength, compressed: compressed.byteLength, data: compressed });
-      }
+      compressProgress.textContent = `Сжатие файла ${i + 1} из ${selected.length}...\n${file.name}`;
+      const data = await file.arrayBuffer();
+      const compressed = await postBinary('/v1/compress', data, 'Ошибка сжатия');
+      results.push({ name: file.name, original: data.byteLength, compressed: compressed.byteLength, data: compressed });
     }
     
     const totalOriginal = results.reduce((sum, r) => sum + r.original, 0);
@@ -415,9 +396,8 @@ downloadCompressedButton.addEventListener('click', () => {
   URL.revokeObjectURL(url);
 });
 
-async function postBinary(path, body, label, fast = false) {
+async function postBinary(path, body, label) {
   const headers = { 'Content-Type': 'application/octet-stream' };
-  if (fast) headers['X-Compression-Profile'] = 'fast';
   const response = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers,
@@ -447,29 +427,6 @@ async function mapWithConcurrency(count, concurrency, mapper) {
   }
   await Promise.all(Array.from({ length: Math.min(count, concurrency) }, () => worker()));
   return results;
-}
-
-function createChunkedArchive(name, originalSize, chunks) {
-  const nameBytes = new TextEncoder().encode(name);
-  if (nameBytes.length > 65535) throw new Error('Слишком длинное имя файла');
-  const tableSize = 20 + nameBytes.length + chunks.length * 4;
-  const totalSize = tableSize + chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
-  const output = new Uint8Array(totalSize);
-  const view = new DataView(output.buffer);
-  output.set([0x53, 0x41, 0x42, 0x4c, 1, 0], 0); // SABL v1
-  view.setUint16(6, nameBytes.length, true);
-  view.setUint32(8, chunks.length, true);
-  view.setBigUint64(12, BigInt(originalSize), true);
-  output.set(nameBytes, 20);
-  let tablePosition = 20 + nameBytes.length;
-  let payloadPosition = tableSize;
-  for (const chunk of chunks) {
-    view.setUint32(tablePosition, chunk.byteLength, true);
-    tablePosition += 4;
-    output.set(new Uint8Array(chunk), payloadPosition);
-    payloadPosition += chunk.byteLength;
-  }
-  return output.buffer;
 }
 
 function isChunkedArchive(buffer) {
@@ -506,7 +463,7 @@ async function decompressChunkedArchive(buffer, fallbackName, onProgress = () =>
     payloadPosition += size;
   }
   let completed = 0;
-  const decodedChunks = await mapWithConcurrency(chunkCount, CHUNK_CONCURRENCY, async i => {
+  const decodedChunks = await mapWithConcurrency(chunkCount, LEGACY_CHUNK_CONCURRENCY, async i => {
     onProgress(`${completed}/${chunkCount}`);
     const chunkArchive = bytes.slice(chunkOffsets[i], chunkOffsets[i] + sizes[i]);
     const decoded = new Uint8Array(await postBinary('/v1/decompress', chunkArchive, `Ошибка распаковки блока ${i + 1}`));
