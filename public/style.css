@@ -122,6 +122,7 @@ body {
   gap: 6px;
   min-height: 0;
   max-height: 400px;
+  padding-right: 5px;
 }
 
 .file-list::-webkit-scrollbar {
@@ -138,6 +139,28 @@ body {
 }
 
 .file-list::-webkit-scrollbar-thumb:hover {
+  background: #44444a;
+}
+
+.right-panel {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.right-panel::-webkit-scrollbar {
+  width: 8px;
+}
+
+.right-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.right-panel::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+.right-panel::-webkit-scrollbar-thumb:hover {
   background: #44444a;
 }
 
@@ -228,6 +251,11 @@ body {
   justify-content: center;
   margin: auto 0;
   opacity: 0.3;
+}
+
+.idle-icon svg {
+  display: block;
+  overflow: visible;
 }
 
 .idle-text {
