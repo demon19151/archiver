@@ -21,6 +21,7 @@ const compressProgress = document.getElementById('compressProgress');
 const compressStats = document.getElementById('compressStats');
 const decompressProgress = document.getElementById('decompressProgress');
 const decompressStats = document.getElementById('decompressStats');
+const CHUNK_SIZE = 3 * 1024 * 1024;
 
 // State
 let compressFiles = [];
@@ -326,21 +327,23 @@ compressButton.addEventListener('click', async () => {
   try {
     for (let i = 0; i < selected.length; i++) {
       const { file } = selected[i];
-      compressProgress.textContent = `Сжатие файла ${i + 1} из ${selected.length}...\n${file.name}`;
-      
-      const data = await file.arrayBuffer();
-      const response = await fetch(`${API_BASE}/v1/compress`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: data
-      });
-      
-      if (!response.ok) {
-        throw await readApiError(response, 'Ошибка сжатия');
+      if (file.size > CHUNK_SIZE) {
+        const chunks = [];
+        const count = Math.ceil(file.size / CHUNK_SIZE);
+        for (let chunkIndex = 0; chunkIndex < count; chunkIndex++) {
+          compressProgress.textContent = `Сжатие ${i + 1}/${selected.length}\n${file.name}: блок ${chunkIndex + 1}/${count}`;
+          const start = chunkIndex * CHUNK_SIZE;
+          const bytes = await file.slice(start, Math.min(start + CHUNK_SIZE, file.size)).arrayBuffer();
+          chunks.push(await postBinary('/v1/compress', bytes, 'Ошибка сжатия'));
+        }
+        const archive = createChunkedArchive(file.name, file.size, chunks);
+        results.push({ name: file.name, archiveName: `${file.name}.sabl`, original: file.size, compressed: archive.byteLength, data: archive });
+      } else {
+        compressProgress.textContent = `Сжатие файла ${i + 1} из ${selected.length}...\n${file.name}`;
+        const data = await file.arrayBuffer();
+        const compressed = await postBinary('/v1/compress', data, 'Ошибка сжатия');
+        results.push({ name: file.name, original: data.byteLength, compressed: compressed.byteLength, data: compressed });
       }
-      
-      const compressed = await response.arrayBuffer();
-      results.push({ name: file.name, original: data.byteLength, compressed: compressed.byteLength, data: compressed });
     }
     
     const totalOriginal = results.reduce((sum, r) => sum + r.original, 0);
@@ -351,7 +354,7 @@ compressButton.addEventListener('click', async () => {
     
     // Create SARB if multiple files
     if (results.length === 1) {
-      compressedResult = { blob: new Blob([results[0].data]), name: `${results[0].name}.sarc` };
+      compressedResult = { blob: new Blob([results[0].data]), name: results[0].archiveName || `${results[0].name}.sarc` };
     } else {
       const sarb = createSARB(results);
       compressedResult = { blob: new Blob([sarb]), name: 'compressed-files.sarb' };
@@ -405,6 +408,88 @@ downloadCompressedButton.addEventListener('click', () => {
   URL.revokeObjectURL(url);
 });
 
+async function postBinary(path, body, label) {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body
+  });
+  if (response.ok) return response.arrayBuffer();
+  const contentType = response.headers.get('content-type') || '';
+  let detail = '';
+  if (contentType.includes('application/json')) {
+    const payload = await response.json().catch(() => null);
+    detail = payload?.error?.message || payload?.message || '';
+  } else {
+    detail = (await response.text().catch(() => '')).trim().slice(0, 240);
+  }
+  throw new Error(`${label} (HTTP ${response.status})${detail ? `: ${detail}` : ''}`);
+}
+
+function createChunkedArchive(name, originalSize, chunks) {
+  const nameBytes = new TextEncoder().encode(name);
+  if (nameBytes.length > 65535) throw new Error('Слишком длинное имя файла');
+  const tableSize = 20 + nameBytes.length + chunks.length * 4;
+  const totalSize = tableSize + chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const output = new Uint8Array(totalSize);
+  const view = new DataView(output.buffer);
+  output.set([0x53, 0x41, 0x42, 0x4c, 1, 0], 0); // SABL v1
+  view.setUint16(6, nameBytes.length, true);
+  view.setUint32(8, chunks.length, true);
+  view.setBigUint64(12, BigInt(originalSize), true);
+  output.set(nameBytes, 20);
+  let tablePosition = 20 + nameBytes.length;
+  let payloadPosition = tableSize;
+  for (const chunk of chunks) {
+    view.setUint32(tablePosition, chunk.byteLength, true);
+    tablePosition += 4;
+    output.set(new Uint8Array(chunk), payloadPosition);
+    payloadPosition += chunk.byteLength;
+  }
+  return output.buffer;
+}
+
+function isChunkedArchive(buffer) {
+  if (buffer.byteLength < 4) return false;
+  const bytes = new Uint8Array(buffer, 0, 4);
+  return bytes[0] === 0x53 && bytes[1] === 0x41 && bytes[2] === 0x42 && bytes[3] === 0x4c;
+}
+
+async function decompressChunkedArchive(buffer, fallbackName, onProgress = () => {}) {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length < 20 || bytes[4] !== 1 || bytes[5] !== 0) throw new Error('Повреждённый блочный архив');
+  const view = new DataView(buffer);
+  const nameLength = view.getUint16(6, true);
+  const chunkCount = view.getUint32(8, true);
+  const originalSizeBig = view.getBigUint64(12, true);
+  if (originalSizeBig > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('Исходный файл слишком велик');
+  const originalSize = Number(originalSizeBig);
+  let position = 20 + nameLength;
+  if (position > bytes.length || chunkCount > Math.floor((bytes.length - position) / 4)) throw new Error('Повреждена таблица блоков');
+  const sizes = [];
+  let payloadPosition = position + chunkCount * 4;
+  for (let i = 0; i < chunkCount; i++) {
+    const size = view.getUint32(position, true);
+    position += 4;
+    sizes.push(size);
+  }
+  if (sizes.reduce((sum, size) => sum + size, payloadPosition) !== bytes.length) throw new Error('Размер блочного архива не совпадает');
+  const output = new Uint8Array(originalSize);
+  let outputPosition = 0;
+  const name = new TextDecoder().decode(bytes.subarray(20, 20 + nameLength));
+  for (let i = 0; i < chunkCount; i++) {
+    onProgress(`${i + 1}/${chunkCount}`);
+    const chunkArchive = bytes.slice(payloadPosition, payloadPosition + sizes[i]);
+    payloadPosition += sizes[i];
+    const chunk = new Uint8Array(await postBinary('/v1/decompress', chunkArchive, 'Ошибка распаковки блока'));
+    if (outputPosition + chunk.length > output.length) throw new Error('Блоки превышают исходный размер');
+    output.set(chunk, outputPosition);
+    outputPosition += chunk.length;
+  }
+  if (outputPosition !== output.length) throw new Error('Восстановленный размер файла не совпадает');
+  return { name: name || fallbackName.replace(/\.(sarc|sarb)$/i, ''), compressed: bytes.length, decompressed: output.length, data: output.buffer };
+}
+
 // Decompress
 decompressButton.addEventListener('click', async () => {
   const selected = decompressArchives.filter(f => f.selected);
@@ -426,34 +511,24 @@ decompressButton.addEventListener('click', async () => {
       const data = await file.arrayBuffer();
       
       // Check if SARB
-      if (isSARB(data)) {
+      if (isChunkedArchive(data)) {
+        results.push(await decompressChunkedArchive(data, file.name, progress => {
+          decompressProgress.textContent = `Распаковка архива ${i + 1}/${selected.length}\n${file.name}: блок ${progress}`;
+        }));
+      } else if (isSARB(data)) {
         const entries = parseSARB(data);
         for (const entry of entries) {
-          const response = await fetch(`${API_BASE}/v1/decompress`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/octet-stream' },
-            body: entry.data
-          });
-          
-          if (!response.ok) {
-            throw await readApiError(response, 'Ошибка распаковки');
+          if (isChunkedArchive(entry.data)) {
+            results.push(await decompressChunkedArchive(entry.data, entry.name, progress => {
+              decompressProgress.textContent = `Распаковка ${entry.name}: блок ${progress}`;
+            }));
+          } else {
+            const decompressed = await postBinary('/v1/decompress', entry.data, 'Ошибка распаковки');
+            results.push({ name: entry.name.replace(/\.sarc$/i, ''), compressed: entry.data.byteLength, decompressed: decompressed.byteLength, data: decompressed });
           }
-          
-          const decompressed = await response.arrayBuffer();
-          results.push({ name: entry.name, compressed: entry.data.byteLength, decompressed: decompressed.byteLength, data: decompressed });
         }
       } else {
-        const response = await fetch(`${API_BASE}/v1/decompress`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body: data
-        });
-        
-        if (!response.ok) {
-          throw await readApiError(response, 'Ошибка распаковки');
-        }
-        
-        const decompressed = await response.arrayBuffer();
+        const decompressed = await postBinary('/v1/decompress', data, 'Ошибка распаковки');
         const name = file.name.replace(/\.(sarc|sarb)$/i, '');
         results.push({ name, compressed: data.byteLength, decompressed: decompressed.byteLength, data: decompressed });
       }
