@@ -545,7 +545,7 @@ function shouldTryDelta(input) {
   return entropy(delta) + 0.12 < entropy(sample);
 }
 
-export function compress(inputData, options = {}) {
+export function compress(inputData) {
   const input = Buffer.isBuffer(inputData) ? inputData : Buffer.from(inputData);
   if (input.length > MAX_ORIGINAL_SIZE) fail('input_too_large', 'Файл превышает допустимый размер', 413);
   // The empty archive has a dedicated one-byte representation. Zero bytes
@@ -695,7 +695,7 @@ function readHeader(archive) {
 function readV3Header(archive) {
   if (archive.length < 5) fail('invalid_archive', 'Обрезан компактный заголовок');
   const method = archive[0] - 0xf0;
-  if (method < 0 || method > 8) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
+  if (method < 0 || method > 6) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
   if (method === 0) {
     const originalSize = archive.length - 5;
     return { legacy: false, v2: false, compact: true, method, originalSize, params: Buffer.alloc(0), payload: archive.subarray(5), checksum: archive.subarray(1, 5) };
@@ -711,7 +711,7 @@ function readV3Header(archive) {
     if (state.position + 2 > archive.length) fail('invalid_archive', 'Обрезан период повторения');
     params = archive.subarray(state.position, state.position + 2);
     state.position += 2;
-  } else if ([1, 2, 3, 6, 8].includes(method)) {
+  } else if ([1, 2, 3, 6].includes(method)) {
     if (state.position + 6 > archive.length) fail('invalid_archive', 'Обрезана таблица Хаффмана');
     const parameterOffset = method === 6 ? 1 : 0;
     if (method === 6 && state.position + 1 > archive.length) fail('invalid_archive', 'Обрезан идентификатор преобразования');

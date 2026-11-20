@@ -77,6 +77,6 @@ test('wrong checksum is rejected', () => {
 
 test('unknown method is rejected', () => {
   const archive = compress(Buffer.from('hello'));
-  archive[0] = 0xf9;
+  archive[0] = 0xf7;
   assert.throws(() => decompress(archive), error => error.code === 'unsupported_method');
 });
