@@ -21,7 +21,11 @@ const compressProgress = document.getElementById('compressProgress');
 const compressStats = document.getElementById('compressStats');
 const decompressProgress = document.getElementById('decompressProgress');
 const decompressStats = document.getElementById('decompressStats');
-const CHUNK_SIZE = 3 * 1024 * 1024;
+// Vercel function request bodies are limited to roughly 4.5 MB. Keep blocks
+// at 4 MiB to leave room for transport overhead, and process a small bounded
+// number concurrently to amortize serverless/network latency on large files.
+const CHUNK_SIZE = 4 * 1024 * 1024;
+const CHUNK_CONCURRENCY = 3;
 
 // State
 let compressFiles = [];
@@ -328,14 +332,17 @@ compressButton.addEventListener('click', async () => {
     for (let i = 0; i < selected.length; i++) {
       const { file } = selected[i];
       if (file.size > CHUNK_SIZE) {
-        const chunks = [];
         const count = Math.ceil(file.size / CHUNK_SIZE);
-        for (let chunkIndex = 0; chunkIndex < count; chunkIndex++) {
-          compressProgress.textContent = `Сжатие ${i + 1}/${selected.length}\n${file.name}: блок ${chunkIndex + 1}/${count}`;
+        let completed = 0;
+        const chunks = await mapWithConcurrency(count, CHUNK_CONCURRENCY, async chunkIndex => {
+          compressProgress.textContent = `Сжатие ${i + 1}/${selected.length}\n${file.name}: блоки ${completed}/${count}`;
           const start = chunkIndex * CHUNK_SIZE;
           const bytes = await file.slice(start, Math.min(start + CHUNK_SIZE, file.size)).arrayBuffer();
-          chunks.push(await postBinary('/v1/compress', bytes, 'Ошибка сжатия'));
-        }
+          const archiveChunk = await postBinary('/v1/compress', bytes, `Ошибка сжатия блока ${chunkIndex + 1}`);
+          completed++;
+          compressProgress.textContent = `Сжатие ${i + 1}/${selected.length}\n${file.name}: блоки ${completed}/${count}`;
+          return archiveChunk;
+        });
         const archive = createChunkedArchive(file.name, file.size, chunks);
         results.push({ name: file.name, archiveName: `${file.name}.sabl`, original: file.size, compressed: archive.byteLength, data: archive });
       } else {
@@ -426,6 +433,20 @@ async function postBinary(path, body, label) {
   throw new Error(`${label} (HTTP ${response.status})${detail ? `: ${detail}` : ''}`);
 }
 
+async function mapWithConcurrency(count, concurrency, mapper) {
+  const results = new Array(count);
+  let nextIndex = 0;
+  async function worker() {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= count) return;
+      results[index] = await mapper(index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(count, concurrency) }, () => worker()));
+  return results;
+}
+
 function createChunkedArchive(name, originalSize, chunks) {
   const nameBytes = new TextEncoder().encode(name);
   if (nameBytes.length > 65535) throw new Error('Слишком длинное имя файла');
@@ -477,11 +498,21 @@ async function decompressChunkedArchive(buffer, fallbackName, onProgress = () =>
   const output = new Uint8Array(originalSize);
   let outputPosition = 0;
   const name = new TextDecoder().decode(bytes.subarray(20, 20 + nameLength));
-  for (let i = 0; i < chunkCount; i++) {
-    onProgress(`${i + 1}/${chunkCount}`);
-    const chunkArchive = bytes.slice(payloadPosition, payloadPosition + sizes[i]);
-    payloadPosition += sizes[i];
-    const chunk = new Uint8Array(await postBinary('/v1/decompress', chunkArchive, 'Ошибка распаковки блока'));
+  const chunkOffsets = [];
+  for (const size of sizes) {
+    chunkOffsets.push(payloadPosition);
+    payloadPosition += size;
+  }
+  let completed = 0;
+  const decodedChunks = await mapWithConcurrency(chunkCount, CHUNK_CONCURRENCY, async i => {
+    onProgress(`${completed}/${chunkCount}`);
+    const chunkArchive = bytes.slice(chunkOffsets[i], chunkOffsets[i] + sizes[i]);
+    const decoded = new Uint8Array(await postBinary('/v1/decompress', chunkArchive, `Ошибка распаковки блока ${i + 1}`));
+    completed++;
+    onProgress(`${completed}/${chunkCount}`);
+    return decoded;
+  });
+  for (const chunk of decodedChunks) {
     if (outputPosition + chunk.length > output.length) throw new Error('Блоки превышают исходный размер');
     output.set(chunk, outputPosition);
     outputPosition += chunk.length;
