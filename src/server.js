@@ -14,7 +14,7 @@ function sendJson(response, status, value) {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': body.length,
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Compression-Profile',
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Private-Network': 'true',
     'Access-Control-Max-Age': '86400'
@@ -27,7 +27,7 @@ function sendBytes(response, body, contentType = 'application/octet-stream') {
     'Content-Type': contentType,
     'Content-Length': body.length,
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Compression-Profile',
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Private-Network': 'true',
     'Access-Control-Max-Age': '86400'
@@ -72,7 +72,7 @@ const server = createServer(async (request, response) => {
     if (request.method === 'OPTIONS') {
       response.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Headers': 'Content-Type, X-Compression-Profile',
         'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
         'Access-Control-Allow-Private-Network': 'true',
         'Access-Control-Max-Age': '86400'
@@ -84,9 +84,11 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, { status: 'ok' });
       return;
     }
-    if (request.method === 'POST' && (request.url === '/v1/compress' || request.url === '/v1/decompress')) {
-      const body = await readBody(request, request.url === '/v1/compress' ? MAX_ORIGINAL_SIZE : MAX_ARCHIVE_SIZE);
-      const result = request.url === '/v1/compress' ? compress(body) : decompress(body);
+    const pathname = new URL(request.url, 'http://localhost').pathname;
+    if (request.method === 'POST' && (pathname === '/v1/compress' || pathname === '/v1/decompress')) {
+      const body = await readBody(request, pathname === '/v1/compress' ? MAX_ORIGINAL_SIZE : MAX_ARCHIVE_SIZE);
+      const fast = request.headers['x-compression-profile'] === 'fast';
+      const result = pathname === '/v1/compress' ? compress(body, { fast }) : decompress(body);
       sendBytes(response, result);
       return;
     }

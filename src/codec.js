@@ -545,7 +545,7 @@ function shouldTryDelta(input) {
   return entropy(delta) + 0.12 < entropy(sample);
 }
 
-export function compress(inputData) {
+export function compress(inputData, options = {}) {
   const input = Buffer.isBuffer(inputData) ? inputData : Buffer.from(inputData);
   if (input.length > MAX_ORIGINAL_SIZE) fail('input_too_large', 'Файл превышает допустимый размер', 413);
   // The empty archive has a dedicated one-byte representation. Zero bytes
@@ -560,6 +560,7 @@ export function compress(inputData) {
     return 1 + writeVarUint(input.length).length + 4 + params.length + payload.length;
   };
 
+  const fast = options.fast === true;
   const period = repeatedPeriod(input);
   if (period) {
     const params = Buffer.alloc(2);
@@ -585,10 +586,25 @@ export function compress(inputData) {
     if (rleTotal < best.total) best = { method: 4, params: Buffer.alloc(0), payload: rle, total: rleTotal };
   }
 
+  if (fast) {
+    const quickLz = lzssEncode(input, 1);
+    const quickHuffman = buildHuffman(quickLz);
+    const fastParams = quickHuffman ? huffmanParams(quickHuffman) : Buffer.alloc(0);
+    const fastPayload = quickHuffman ? quickHuffman.data : quickLz;
+    const fastMethod = quickHuffman ? 8 : 7;
+    const quickTotal = encodedSize(fastMethod, fastParams, fastPayload);
+    if (quickTotal < best.total) {
+      best = { method: fastMethod, params: fastParams, payload: fastPayload, total: quickTotal };
+    }
+    return createArchive(best.method, input, best.params, best.payload, checksum);
+  }
+
   // Keep the hash-chain effort proportional to file size. Deep matching is
   // useful for small text; on multi-megabyte files it disproportionately costs
   // CPU while bringing only marginal compression gains.
-  const searchLimit = input.length < 64 * 1024 ? 48 : input.length < 1024 * 1024 ? 24 : input.length < 8 * 1024 * 1024 ? 12 : 6;
+  const searchLimit = fast
+    ? 2
+    : input.length < 64 * 1024 ? 48 : input.length < 1024 * 1024 ? 24 : input.length < 8 * 1024 * 1024 ? 12 : 6;
   const lz = lzssEncode(input, searchLimit);
   const lzHuffman = buildHuffman(lz);
   if (lzHuffman) {
@@ -597,15 +613,15 @@ export function compress(inputData) {
     if (total < best.total) best = { method: 1, params, payload: lzHuffman.data, total };
   }
 
-  const directHuffman = buildHuffman(input);
+  const directHuffman = fast ? null : buildHuffman(input);
   if (directHuffman) {
     const params = huffmanParams(directHuffman);
     const total = encodedSize(2, params, directHuffman.data);
     if (total < best.total) best = { method: 2, params, payload: directHuffman.data, total };
   }
 
-  const transformId = chooseTransform(input);
-  if (!transformId && shouldTryDelta(input)) {
+  const transformId = fast ? 0 : chooseTransform(input);
+  if (!fast && !transformId && shouldTryDelta(input)) {
     const delta = deltaEncode(input);
     const deltaLz = lzssEncode(delta, searchLimit);
     const deltaHuffman = buildHuffman(deltaLz);
@@ -695,7 +711,7 @@ function readHeader(archive) {
 function readV3Header(archive) {
   if (archive.length < 5) fail('invalid_archive', 'Обрезан компактный заголовок');
   const method = archive[0] - 0xf0;
-  if (method < 0 || method > 6) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
+  if (method < 0 || method > 8) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
   if (method === 0) {
     const originalSize = archive.length - 5;
     return { legacy: false, v2: false, compact: true, method, originalSize, params: Buffer.alloc(0), payload: archive.subarray(5), checksum: archive.subarray(1, 5) };
@@ -711,7 +727,7 @@ function readV3Header(archive) {
     if (state.position + 2 > archive.length) fail('invalid_archive', 'Обрезан период повторения');
     params = archive.subarray(state.position, state.position + 2);
     state.position += 2;
-  } else if ([1, 2, 3, 6].includes(method)) {
+  } else if ([1, 2, 3, 6, 8].includes(method)) {
     if (state.position + 6 > archive.length) fail('invalid_archive', 'Обрезана таблица Хаффмана');
     const parameterOffset = method === 6 ? 1 : 0;
     if (method === 6 && state.position + 1 > archive.length) fail('invalid_archive', 'Обрезан идентификатор преобразования');
@@ -816,6 +832,15 @@ export function decompress(archiveData) {
     const huffman = parseHuffman(header);
     if (huffman.decodedSize !== header.originalSize) fail('invalid_archive', 'Размер Хаффмана не совпадает с исходным');
     output = decodeHuffman(header.payload, huffman.lengths, huffman.decodedSize);
+  } else if (header.method === 7) {
+    output = lzssDecode(header.payload, header.originalSize);
+  } else if (header.method === 8) {
+    const huffman = parseHuffman({ ...header, method: 1 });
+    if (huffman.decodedSize > MAX_ORIGINAL_SIZE + Math.ceil(MAX_ORIGINAL_SIZE / 8) + 16) {
+      fail('invalid_archive', 'Слишком большой промежуточный поток');
+    }
+    const stream = decodeHuffman(header.payload, huffman.lengths, huffman.decodedSize);
+    output = lzssDecode(stream, header.originalSize);
   } else {
     const huffman = parseHuffman(header);
     const lzStream = decodeHuffman(header.payload, huffman.lengths, huffman.decodedSize);
@@ -840,7 +865,7 @@ export const formatInfo = {
   version: VERSION,
   headerSize: 5,
   storeHeaderSize: 5,
-  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman' }
+  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 7: 'fast-lzss', 8: 'fast-lzss+huffman' }
 };
 
 export const _testInternals = { lzssEncode, lzssDecode, buildHuffman, decodeHuffman };

@@ -7,7 +7,7 @@ export function sendJson(res, status, value) {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Compression-Profile');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Private-Network', 'true');
   res.setHeader('Access-Control-Max-Age', '86400');
@@ -19,7 +19,7 @@ export function sendBytes(res, body) {
   res.setHeader('Content-Type', 'application/octet-stream');
   res.setHeader('Content-Length', body.length);
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Compression-Profile');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Private-Network', 'true');
   res.setHeader('Access-Control-Max-Age', '86400');
@@ -55,7 +55,8 @@ export async function handleCodec(req, res, operation) {
       return;
     }
     const body = await readBody(req, operation === 'compress' ? MAX_ORIGINAL_SIZE : MAX_ARCHIVE_SIZE);
-    sendBytes(res, operation === 'compress' ? compress(body) : decompress(body));
+    const fast = req.headers['x-compression-profile'] === 'fast';
+    sendBytes(res, operation === 'compress' ? compress(body, { fast }) : decompress(body));
   } catch (error) {
     if (error instanceof ArchiveError) {
       sendJson(res, error.status, { error: { code: error.code, message: error.message } });

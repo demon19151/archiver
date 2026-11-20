@@ -50,6 +50,13 @@ test('delta transform compresses structured 32-bit binary values', () => {
   assert.deepEqual(decompress(archive), input);
 });
 
+test('fast profile round-trips chunk-sized mixed data', () => {
+  const input = Buffer.alloc(256 * 1024);
+  for (let i = 0; i < input.length; i++) input[i] = (i * 37 + (i >>> 8)) & 255;
+  const archive = compress(input, { fast: true });
+  assert.deepEqual(decompress(archive), input);
+});
+
 test('incompressible binary has only small overhead', () => {
   const input = Buffer.from(Array.from({ length: 4096 }, () => Math.floor(Math.random() * 256)));
   const archive = compress(input);
@@ -77,6 +84,6 @@ test('wrong checksum is rejected', () => {
 
 test('unknown method is rejected', () => {
   const archive = compress(Buffer.from('hello'));
-  archive[0] = 0xf7;
+  archive[0] = 0xf9;
   assert.throws(() => decompress(archive), error => error.code === 'unsupported_method');
 });

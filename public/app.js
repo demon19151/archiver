@@ -338,7 +338,7 @@ compressButton.addEventListener('click', async () => {
           compressProgress.textContent = `Сжатие ${i + 1}/${selected.length}\n${file.name}: блоки ${completed}/${count}`;
           const start = chunkIndex * CHUNK_SIZE;
           const bytes = await file.slice(start, Math.min(start + CHUNK_SIZE, file.size)).arrayBuffer();
-          const archiveChunk = await postBinary('/v1/compress', bytes, `Ошибка сжатия блока ${chunkIndex + 1}`);
+          const archiveChunk = await postBinary('/v1/compress', bytes, `Ошибка сжатия блока ${chunkIndex + 1}`, true);
           completed++;
           compressProgress.textContent = `Сжатие ${i + 1}/${selected.length}\n${file.name}: блоки ${completed}/${count}`;
           return archiveChunk;
@@ -415,10 +415,12 @@ downloadCompressedButton.addEventListener('click', () => {
   URL.revokeObjectURL(url);
 });
 
-async function postBinary(path, body, label) {
+async function postBinary(path, body, label, fast = false) {
+  const headers = { 'Content-Type': 'application/octet-stream' };
+  if (fast) headers['X-Compression-Profile'] = 'fast';
   const response = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' },
+    headers,
     body
   });
   if (response.ok) return response.arrayBuffer();
