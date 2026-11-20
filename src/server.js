@@ -15,9 +15,7 @@ function sendJson(response, status, value) {
     'Content-Length': body.length,
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Private-Network': 'true',
-    'Access-Control-Max-Age': '86400'
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
   });
   response.end(body);
 }
@@ -28,9 +26,7 @@ function sendBytes(response, body, contentType = 'application/octet-stream') {
     'Content-Length': body.length,
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Private-Network': 'true',
-    'Access-Control-Max-Age': '86400'
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
   });
   response.end(body);
 }
@@ -73,9 +69,7 @@ const server = createServer(async (request, response) => {
       response.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-        'Access-Control-Allow-Private-Network': 'true',
-        'Access-Control-Max-Age': '86400'
+        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
       });
       response.end();
       return;
@@ -84,10 +78,9 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, { status: 'ok' });
       return;
     }
-    const pathname = new URL(request.url, 'http://localhost').pathname;
-    if (request.method === 'POST' && (pathname === '/v1/compress' || pathname === '/v1/decompress')) {
-      const body = await readBody(request, pathname === '/v1/compress' ? MAX_ORIGINAL_SIZE : MAX_ARCHIVE_SIZE);
-      const result = pathname === '/v1/compress' ? compress(body) : decompress(body);
+    if (request.method === 'POST' && (request.url === '/v1/compress' || request.url === '/v1/decompress')) {
+      const body = await readBody(request, request.url === '/v1/compress' ? MAX_ORIGINAL_SIZE : MAX_ARCHIVE_SIZE);
+      const result = request.url === '/v1/compress' ? compress(body) : decompress(body);
       sendBytes(response, result);
       return;
     }

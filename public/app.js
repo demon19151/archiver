@@ -37,18 +37,6 @@ function formatSize(bytes) {
   return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
 }
 
-async function readApiError(response, fallback) {
-  const contentType = response.headers.get('content-type') || '';
-  let detail = '';
-  if (contentType.includes('application/json')) {
-    const payload = await response.json().catch(() => null);
-    detail = payload?.error?.message || payload?.message || '';
-  } else {
-    detail = (await response.text().catch(() => '')).trim().slice(0, 240);
-  }
-  return new Error(`${fallback} (HTTP ${response.status})${detail ? `: ${detail}` : ''}`);
-}
-
 function switchMode(mode) {
   currentMode = mode;
   idleState.hidden = true;
@@ -336,7 +324,8 @@ compressButton.addEventListener('click', async () => {
       });
       
       if (!response.ok) {
-        throw await readApiError(response, 'Ошибка сжатия');
+        const error = await response.json().catch(() => ({ error: { message: response.statusText } }));
+        throw new Error(error.error?.message || 'Ошибка сжатия');
       }
       
       const compressed = await response.arrayBuffer();
@@ -436,7 +425,8 @@ decompressButton.addEventListener('click', async () => {
           });
           
           if (!response.ok) {
-            throw await readApiError(response, 'Ошибка распаковки');
+            const error = await response.json().catch(() => ({ error: { message: response.statusText } }));
+            throw new Error(error.error?.message || 'Ошибка распаковки');
           }
           
           const decompressed = await response.arrayBuffer();
@@ -450,7 +440,8 @@ decompressButton.addEventListener('click', async () => {
         });
         
         if (!response.ok) {
-          throw await readApiError(response, 'Ошибка распаковки');
+          const error = await response.json().catch(() => ({ error: { message: response.statusText } }));
+          throw new Error(error.error?.message || 'Ошибка распаковки');
         }
         
         const decompressed = await response.arrayBuffer();
