@@ -303,6 +303,44 @@ function huffmanParams(huffman) {
   return params;
 }
 
+// An additional representation of the SAME Huffman stream: separate symbols
+// from code lengths, packing two lengths into one byte (only lengths <= 15).
+function compactHuffmanParams(method, params) {
+  const offset = method === 6 ? 1 : 0;
+  const count = params.readUInt16LE(offset + 4);
+  for (let i = 0; i < count; i++) if (params[offset + 7 + i * 2] > 15) return null;
+  const compact = Buffer.alloc(1 + offset + 6 + count + Math.ceil(count / 2));
+  compact[0] = method;
+  if (offset) compact[1] = params[0];
+  params.copy(compact, 1 + offset, offset, offset + 6);
+  const symbolsStart = 7 + offset;
+  const lengthsStart = symbolsStart + count;
+  for (let i = 0; i < count; i++) {
+    compact[symbolsStart + i] = params[offset + 6 + i * 2];
+    compact[lengthsStart + (i >>> 1)] |= params[offset + 7 + i * 2] << (i % 2 ? 0 : 4);
+  }
+  return compact;
+}
+
+function expandCompactHeader(header) {
+  const params = header.params;
+  const method = params[0];
+  if (![1, 2, 3, 6].includes(method)) fail('invalid_archive', 'Некорректный метод компактной таблицы');
+  const offset = method === 6 ? 1 : 0;
+  const count = params.readUInt16LE(5 + offset);
+  const expanded = Buffer.alloc(offset + 6 + count * 2);
+  if (offset) expanded[0] = params[1];
+  params.copy(expanded, offset, 1 + offset, 7 + offset);
+  const symbolsStart = 7 + offset;
+  const lengthsStart = symbolsStart + count;
+  for (let i = 0; i < count; i++) {
+    expanded[offset + 6 + i * 2] = params[symbolsStart + i];
+    expanded[offset + 7 + i * 2] = (params[lengthsStart + (i >>> 1)] >>> (i % 2 ? 0 : 4)) & 15;
+  }
+  if (count % 2 && (params[params.length - 1] & 15)) fail('invalid_archive', 'Некорректное заполнение таблицы');
+  return { ...header, method, params: expanded };
+}
+
 function createArchive(method, original, params, payload, checksum) {
   // SARC v4 uses a method-specific one-byte signature. For stored data the
   // payload length is implicit; compressed methods carry an original-size
@@ -487,6 +525,77 @@ function rleDecode(payload, outputSize) {
   return output;
 }
 
+// Mixed RLE: a varint stores length*2 + kind. Kind 0 is a literal span;
+// kind 1 is a repeated byte. Unlike pair-only RLE, random prefixes and isolated
+// noise bytes don't cost two bytes per input byte. Never grow past the current
+// best candidate's budget.
+function mixedRleEncode(input, budget) {
+  if (budget < 3) return null;
+  const output = Buffer.allocUnsafe(Math.min(input.length, budget));
+  let written = 0;
+  let literalStart = 0;
+  const emit = (start, length, run) => {
+    const code = writeVarUint(length * 2 + (run ? 1 : 0));
+    const size = code.length + (run ? 1 : length);
+    if (written + size >= output.length) return false;
+    for (const byte of code) output[written++] = byte;
+    if (run) output[written++] = input[start];
+    else {
+      input.copy(output, written, start, start + length);
+      written += length;
+    }
+    return true;
+  };
+  let position = 0;
+  while (position < input.length) {
+    let end = position + 1;
+    while (end < input.length && input[end] === input[position]) end++;
+    if (end - position >= 4) {
+      if (position > literalStart && !emit(literalStart, position - literalStart, false)) return null;
+      if (!emit(position, end - position, true)) return null;
+      literalStart = end;
+    }
+    position = end;
+  }
+  if (literalStart < input.length && !emit(literalStart, input.length - literalStart, false)) return null;
+  return Buffer.from(output.subarray(0, written));
+}
+
+function mixedRleDecode(payload, outputSize) {
+  const output = Buffer.alloc(outputSize);
+  const state = { position: 0 };
+  let written = 0;
+  while (state.position < payload.length) {
+    const code = readVarUint(payload, state);
+    const length = Math.floor(code / 2);
+    if (!length || length > outputSize - written) fail('invalid_archive', 'Некорректная длина серии');
+    if (code % 2) {
+      if (state.position >= payload.length) fail('invalid_archive', 'Обрезана серия');
+      output.fill(payload[state.position++], written, written + length);
+    } else {
+      if (length > payload.length - state.position) fail('invalid_archive', 'Обрезан литеральный участок');
+      payload.copy(output, written, state.position, state.position + length);
+      state.position += length;
+    }
+    written += length;
+  }
+  if (written !== outputSize) fail('invalid_archive', 'Размер серий не совпадает с размером файла');
+  return output;
+}
+
+function hasLongRuns(input) {
+  // Probe several regions before adding a full pass on large media files.
+  if (input.length <= 64 * 1024) return true;
+  const size = 4096;
+  for (const start of [0, Math.floor(input.length / 2), Math.max(0, input.length - size)]) {
+    const end = Math.min(input.length, start + size);
+    for (let i = start + 3; i < end; i++) {
+      if (input[i] === input[i - 1] && input[i] === input[i - 2] && input[i] === input[i - 3]) return true;
+    }
+  }
+  return false;
+}
+
 function repeatedPeriod(input) {
   if (input.length < 2) return 0;
   // Find a candidate period in a bounded prefix instead of allocating a
@@ -576,6 +685,15 @@ export function compress(inputData) {
     if (method === 0) return 5 + payload.length;
     return 1 + writeVarUint(input.length).length + 4 + params.length + payload.length;
   };
+  const considerHuffman = (method, params, payload) => {
+    const compact = compactHuffmanParams(method, params);
+    if (compact && compact.length < params.length) {
+      method = 11;
+      params = compact;
+    }
+    const total = encodedSize(method, params, payload);
+    if (total < best.total) best = { method, params, payload, total };
+  };
 
   const period = repeatedPeriod(input);
   if (period) {
@@ -607,18 +725,18 @@ export function compress(inputData) {
   // CPU while bringing only marginal compression gains.
   const searchLimit = input.length < 64 * 1024 ? 48 : input.length < 1024 * 1024 ? 24 : input.length < 8 * 1024 * 1024 ? 12 : 6;
   const lz = lzssEncode(input, searchLimit);
+  const rawLzTotal = encodedSize(9, Buffer.alloc(0), lz);
+  if (rawLzTotal < best.total) best = { method: 9, params: Buffer.alloc(0), payload: lz, total: rawLzTotal };
   const lzHuffman = buildHuffman(lz);
   if (lzHuffman) {
     const params = huffmanParams(lzHuffman);
-    const total = encodedSize(1, params, lzHuffman.data);
-    if (total < best.total) best = { method: 1, params, payload: lzHuffman.data, total };
+    considerHuffman(1, params, lzHuffman.data);
   }
 
   const directHuffman = buildHuffman(input);
   if (directHuffman) {
     const params = huffmanParams(directHuffman);
-    const total = encodedSize(2, params, directHuffman.data);
-    if (total < best.total) best = { method: 2, params, payload: directHuffman.data, total };
+    considerHuffman(2, params, directHuffman.data);
   }
 
   const transformId = chooseTransform(input);
@@ -628,8 +746,7 @@ export function compress(inputData) {
     const deltaHuffman = buildHuffman(deltaLz);
     if (deltaHuffman) {
       const params = huffmanParams(deltaHuffman);
-      const total = encodedSize(3, params, deltaHuffman.data);
-      if (total < best.total) best = { method: 3, params, payload: deltaHuffman.data, total };
+      considerHuffman(3, params, deltaHuffman.data);
     }
   }
 
@@ -639,8 +756,15 @@ export function compress(inputData) {
     const transformedHuffman = buildHuffman(transformedLz);
     if (transformedHuffman) {
       const params = Buffer.concat([Buffer.from([transformId]), huffmanParams(transformedHuffman)]);
-      const total = encodedSize(6, params, transformedHuffman.data);
-      if (total < best.total) best = { method: 6, params, payload: transformedHuffman.data, total };
+      considerHuffman(6, params, transformedHuffman.data);
+    }
+  }
+  if (hasLongRuns(input)) {
+    const headerSize = encodedSize(10, Buffer.alloc(0), Buffer.alloc(0));
+    const mixed = mixedRleEncode(input, best.total - headerSize);
+    if (mixed) {
+      const total = headerSize + mixed.length;
+      if (total < best.total) best = { method: 10, params: Buffer.alloc(0), payload: mixed, total };
     }
   }
   return createArchive(best.method, input, best.params, best.payload, checksum);
@@ -712,7 +836,7 @@ function readHeader(archive) {
 function readV3Header(archive) {
   if (archive.length < 5) fail('invalid_archive', 'Обрезан компактный заголовок');
   const method = archive[0] - 0xf0;
-  if (method < 0 || method > 6) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
+  if (![0, 1, 2, 3, 4, 5, 6, 9, 10, 11].includes(method)) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
   if (method === 0) {
     const originalSize = archive.length - 5;
     return { legacy: false, v2: false, compact: true, method, originalSize, params: Buffer.alloc(0), payload: archive.subarray(5), checksum: archive.subarray(1, 5) };
@@ -724,7 +848,18 @@ function readV3Header(archive) {
   const checksum = archive.subarray(state.position, state.position + 4);
   state.position += 4;
   let params = Buffer.alloc(0);
-  if (method === 5) {
+  if (method === 11) {
+    if (state.position >= archive.length) fail('invalid_archive', 'Обрезана компактная таблица');
+    const innerMethod = archive[state.position];
+    if (![1, 2, 3, 6].includes(innerMethod)) fail('invalid_archive', 'Некорректный метод таблицы');
+    const offset = innerMethod === 6 ? 1 : 0;
+    if (state.position + 7 + offset > archive.length) fail('invalid_archive', 'Обрезана компактная таблица');
+    const symbols = archive.readUInt16LE(state.position + 5 + offset);
+    const size = 7 + offset + symbols + Math.ceil(symbols / 2);
+    if (!symbols || symbols > 256 || size > archive.length - state.position) fail('invalid_archive', 'Некорректный размер таблицы');
+    params = archive.subarray(state.position, state.position + size);
+    state.position += size;
+  } else if (method === 5) {
     if (state.position + 2 > archive.length) fail('invalid_archive', 'Обрезан период повторения');
     params = archive.subarray(state.position, state.position + 2);
     state.position += 2;
@@ -814,7 +949,8 @@ export function decompress(archiveData) {
   if (archive.length === 1 && archive[0] >= 0xf0 && archive[0] <= 0xf5) {
     fail('invalid_archive', 'Обрезан компактный архив');
   }
-  const header = readHeader(archive);
+  let header = readHeader(archive);
+  if (header.method === 11) header = expandCompactHeader(header);
   let output;
   if (header.method === 0) {
     if (header.params.length !== 0 || header.payload.length !== header.originalSize) {
@@ -829,6 +965,10 @@ export function decompress(archiveData) {
     if (!period || header.payload.length !== period) fail('invalid_archive', 'Некорректный повторяющийся блок');
     output = Buffer.alloc(header.originalSize);
     for (let position = 0; position < output.length; position++) output[position] = header.payload[position % period];
+  } else if (header.method === 9) {
+    output = lzssDecode(header.payload, header.originalSize);
+  } else if (header.method === 10) {
+    output = mixedRleDecode(header.payload, header.originalSize);
   } else if (header.method === 2) {
     const huffman = parseHuffman(header);
     if (huffman.decodedSize !== header.originalSize) fail('invalid_archive', 'Размер Хаффмана не совпадает с исходным');
@@ -857,7 +997,7 @@ export const formatInfo = {
   version: VERSION,
   headerSize: 5,
   storeHeaderSize: 5,
-  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman' }
+  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman' }
 };
 
 export const _testInternals = { lzssEncode, lzssDecode, buildHuffman, decodeHuffman };

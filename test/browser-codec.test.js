@@ -31,6 +31,8 @@ test('browser worker produces server-compatible archives, including large files'
       Buffer.from([255]),
       Buffer.from('Привет! Hello! '.repeat(1000)),
       Buffer.from(JSON.stringify(Array.from({ length: 5000 }, (_, id) => ({ id, city: 'Москва', active: true })))),
+      Buffer.concat([randomBytes(2048), Buffer.alloc(262144)]),
+      Buffer.from('abcabcabcabc!'),
       randomBytes(1024 * 1024),
       Buffer.concat([Buffer.from('II*\0'), Buffer.alloc(8 * 1024 * 1024, 37)])
     ];

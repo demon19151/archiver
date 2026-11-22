@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { compress, decompress, ArchiveError } from '../src/codec.js';
+import { compress, decompress, ArchiveError, _testInternals } from '../src/codec.js';
 
 const sha = data => createHash('sha256').update(data).digest('hex');
 const roundTrip = (name, input) => test(name, () => {
@@ -94,4 +94,61 @@ test('unknown method is rejected', () => {
   const archive = compress(Buffer.from('hello'));
   archive[0] = 0xf7;
   assert.throws(() => decompress(archive), error => error.code === 'unsupported_method');
+});
+
+// Build tiny independently specified new-method records to exercise decoder
+// boundaries even when the adaptive encoder selects another method.
+function record(method, original, payload) {
+  assert.ok(original.length < 128);
+  return Buffer.concat([
+    Buffer.from([0xf0 + method, original.length]),
+    createHash('sha256').update(original).digest().subarray(0, 4), payload
+  ]);
+}
+
+test('raw LZSS decoder accepts references and rejects truncated tokens', () => {
+  const input = Buffer.from('abcabcabcabc!');
+  const payload = _testInternals.lzssEncode(input);
+  const archive = record(9, input, payload);
+  assert.deepEqual(decompress(archive), input);
+  assert.throws(() => decompress(archive.subarray(0, -2)), ArchiveError);
+  assert.throws(() => decompress(Buffer.concat([archive, Buffer.from([0])])), ArchiveError);
+});
+
+test('mixed RLE preserves literal spans and runs with strict bounds', () => {
+  const input = Buffer.from('abzzzzzz!');
+  const payload = Buffer.from([4, 97, 98, 13, 122, 2, 33]);
+  assert.deepEqual(decompress(record(10, input, payload)), input);
+  for (const bad of [Buffer.from([0]), Buffer.from([255,255,255,255,255,1]), Buffer.from([40,97]), Buffer.from([19,122]), Buffer.from([13])]) {
+    assert.throws(() => decompress(record(10, input, bad)), ArchiveError);
+  }
+});
+
+test('compact Huffman table validates symbol count, codes and padding', () => {
+  // Direct Huffman: one symbol A, code 0 of length 1, eight output symbols.
+  const input = Buffer.alloc(8, 65);
+  const params = Buffer.from([2, 8,0,0,0, 1,0, 65, 0x10]);
+  const archive = record(11, input, Buffer.concat([params, Buffer.from([0])]));
+  assert.deepEqual(decompress(archive), input);
+  for (const [offset, value] of [[6, 9], [11, 255], [14, 0], [14, 0x11]]) {
+    const corrupt = Buffer.from(archive);
+    corrupt[offset] = value;
+    assert.throws(() => decompress(corrupt), ArchiveError);
+  }
+});
+
+test('random prefix followed by zeros uses mixed RLE efficiently', () => {
+  const input = Buffer.alloc(262144);
+  let state = 0x12345678;
+  for (let i = 0; i < 2048; i++) {
+    state ^= state << 13; state ^= state >>> 17; state ^= state << 5;
+    input[i] = state & 255;
+  }
+  const archive = compress(input);
+  assert.equal(archive[0], 0xfa);
+  assert.ok(archive.length < 2080);
+  assert.deepEqual(decompress(archive), input);
+  for (const cut of [1, 4, 6, 7, 8, archive.length - 1]) {
+    assert.throws(() => decompress(archive.subarray(0, cut)), ArchiveError);
+  }
 });
