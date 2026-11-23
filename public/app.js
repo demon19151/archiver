@@ -39,7 +39,10 @@ const resetButton = document.getElementById('resetButton');
 const errorMessage = document.getElementById('errorMessage');
 const retryButton = document.getElementById('retryButton');
 const themeToggle = document.getElementById('themeToggle');
-const languageSelect = document.getElementById('languageSelect');
+const languageControl = document.getElementById('languageControl');
+const languageButton = document.getElementById('languageButton');
+const languageButtonText = document.getElementById('languageButtonText');
+const languageMenu = document.getElementById('languageMenu');
 const leftTitle = document.getElementById('leftTitle');
 const leftSubtitle = document.getElementById('leftSubtitle');
 const dropText = document.getElementById('dropText');
@@ -195,7 +198,11 @@ function applyLanguage(language) {
   currentLanguage = language === 'en' ? 'en' : 'ru';
   localStorage.setItem('archiver-language', currentLanguage);
   document.documentElement.lang = currentLanguage;
-  languageSelect.value = currentLanguage;
+  languageButtonText.textContent = currentLanguage.toUpperCase();
+  languageButton.setAttribute('aria-label', tr('languageLabel'));
+  languageMenu.querySelectorAll('[data-language]').forEach(option => {
+    option.setAttribute('aria-selected', String(option.dataset.language === currentLanguage));
+  });
   document.querySelectorAll('[data-i18n]').forEach(element => {
     element.textContent = tr(element.dataset.i18n);
   });
@@ -688,8 +695,25 @@ themeToggle.addEventListener('click', () => {
   applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
 });
 
-languageSelect.addEventListener('change', () => {
-  applyLanguage(languageSelect.value);
+languageButton.addEventListener('click', event => {
+  event.stopPropagation();
+  languageMenu.hidden = !languageMenu.hidden;
+  languageButton.setAttribute('aria-expanded', String(!languageMenu.hidden));
+});
+
+languageMenu.querySelectorAll('[data-language]').forEach(option => {
+  option.addEventListener('click', () => {
+    applyLanguage(option.dataset.language);
+    languageMenu.hidden = true;
+    languageButton.setAttribute('aria-expanded', 'false');
+  });
+});
+
+document.addEventListener('click', event => {
+  if (!languageControl.contains(event.target)) {
+    languageMenu.hidden = true;
+    languageButton.setAttribute('aria-expanded', 'false');
+  }
 });
 
 // Initialize

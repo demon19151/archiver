@@ -57,6 +57,16 @@ test('incompressible binary has only small overhead', () => {
   assert.deepEqual(decompress(archive), input);
 });
 
+test('single-byte files use compact records and all byte values round-trip', () => {
+  for (let value = 0; value < 256; value++) {
+    const input = Buffer.from([value]);
+    const archive = compress(input);
+    assert.ok(archive.length <= 2, `byte ${value} used ${archive.length} bytes`);
+    assert.deepEqual(decompress(archive), input);
+    if (value > 0 && value < 0xf0) assert.equal(archive.length, 1, `byte ${value} should fit in one byte`);
+  }
+});
+
 test('high-entropy multi-megabyte input takes the store path', () => {
   const input = Buffer.alloc(2 * 1024 * 1024);
   let state = 0x12345678;
@@ -113,6 +123,15 @@ test('raw LZSS decoder accepts references and rejects truncated tokens', () => {
   assert.deepEqual(decompress(archive), input);
   assert.throws(() => decompress(archive.subarray(0, -2)), ArchiveError);
   assert.throws(() => decompress(Buffer.concat([archive, Buffer.from([0])])), ArchiveError);
+});
+
+test('small-file bit-packed LZSS round-trips and rejects truncated streams', () => {
+  const input = Buffer.from('short text: repeat this phrase. '.repeat(3));
+  const payload = _testInternals.smallLzEncode(input);
+  const archive = record(12, input, payload);
+  assert.deepEqual(decompress(archive), input);
+  assert.ok(payload.length < input.length);
+  assert.throws(() => decompress(archive.subarray(0, -1)), ArchiveError);
 });
 
 test('mixed RLE preserves literal spans and runs with strict bounds', () => {

@@ -34,16 +34,19 @@
             <path d="M20.5 15.4A8.5 8.5 0 0 1 8.6 3.5 8.5 8.5 0 1 0 20.5 15.4Z"/>
           </svg>
         </button>
-        <label class="language-control">
+        <div id="languageControl" class="language-control">
           <span class="sr-only" data-i18n="languageLabel">Язык</span>
-          <select id="languageSelect" aria-label="Язык" data-i18n-aria="languageLabel">
-            <option value="ru">RU</option>
-            <option value="en">EN</option>
-          </select>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <path d="m6 9 6 6 6-6"/>
-          </svg>
-        </label>
+          <button id="languageButton" class="language-button" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Язык">
+            <span id="languageButtonText">RU</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="m6 9 6 6 6-6"/>
+            </svg>
+          </button>
+          <div id="languageMenu" class="language-menu" role="listbox" hidden>
+            <button type="button" role="option" data-language="ru" aria-selected="true">RU</button>
+            <button type="button" role="option" data-language="en" aria-selected="false">EN</button>
+          </div>
+        </div>
       </div>
     </header>
 
@@ -106,13 +109,6 @@
           <div id="fileList" class="file-list"></div>
         </div>
 
-        <div id="about" class="privacy-notice">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <rect x="3" y="11" width="18" height="11" rx="2"/>
-            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-          </svg>
-          <span data-i18n="privacy">Файлы обрабатываются локально в браузере</span>
-        </div>
       </section>
 
       <section class="right-panel" aria-label="Операция" data-i18n-aria="operationLabel">

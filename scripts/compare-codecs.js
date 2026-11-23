@@ -23,6 +23,8 @@ const sparse = Buffer.alloc(16384);
 for (let i = 80; i < sparse.length; i += 211) sparse[i] = i & 255;
 const cases = [
   ['short-ru', shortText],
+  ['small-431-ru', Buffer.from('Маленький текстовый файл для проверки сжатия. '.repeat(20)).subarray(0, 431)],
+  ['small-1000-ru', Buffer.from('Маленький текстовый файл для проверки сжатия. '.repeat(30)).subarray(0, 1000)],
   ['short-en', Buffer.from('A lossless archive preserves every byte. Select your files, compress them, and download the result. The decoder restores the original bytes using the dictionary stored in the archive. No external data is required.')],
   ['text-ru', Buffer.concat(Array.from({ length: 300 }, (_, i) => Buffer.concat([shortText, Buffer.from(`${i}\n`)])))],
   ['csv', Buffer.from(Array.from({ length: 5000 }, (_, i) => `${i},Москва,${i % 100},active\n`).join(''))],

@@ -10,6 +10,7 @@ const HEADER_SIZE = 28;
 const STORE_HEADER_SIZE = 18;
 const V3_HEADER_SIZE = 14;
 const LEGACY_HEADER_SIZE = 64;
+const COMPACT_ONE_BYTE_MARKER = 0xfe;
 const WINDOW_SIZE = 65536;
 const MAX_MATCH = 258;
 
@@ -525,6 +526,106 @@ function rleDecode(payload, outputSize) {
   return output;
 }
 
+// Bit-packed LZSS for short inputs. Literals cost 9 bits; back-references use
+// a 12-bit distance (1..4096) and an 8-bit length delta (3..258), so the token
+// costs 21 bits instead of the regular stream's 24-bit reference plus flag.
+function smallLzEncode(input) {
+  const output = [];
+  const positionsByKey = new Map();
+  let pendingByte = 0;
+  let pendingBits = 0;
+  const writeBits = (value, count) => {
+    for (let bit = count - 1; bit >= 0; bit--) {
+      pendingByte = (pendingByte << 1) | ((value >>> bit) & 1);
+      if (++pendingBits === 8) {
+        output.push(pendingByte);
+        pendingByte = 0;
+        pendingBits = 0;
+      }
+    }
+  };
+  const keyAt = position => (input[position] << 16) | (input[position + 1] << 8) | input[position + 2];
+  const insert = position => {
+    if (position + 2 >= input.length) return;
+    const key = keyAt(position);
+    const positions = positionsByKey.get(key) || [];
+    positions.push(position);
+    positionsByKey.set(key, positions);
+  };
+
+  let position = 0;
+  while (position < input.length) {
+    let bestLength = 0;
+    let bestDistance = 0;
+    if (position + 2 < input.length) {
+      const candidates = positionsByKey.get(keyAt(position)) || [];
+      let examined = 0;
+      for (let i = candidates.length - 1; i >= 0 && examined < 64; i--, examined++) {
+        const candidate = candidates[i];
+        const distance = position - candidate;
+        if (distance > 4096) break;
+        const limit = Math.min(258, input.length - position);
+        let length = 3;
+        while (length < limit && input[candidate + length] === input[position + length]) length++;
+        if (length > bestLength) {
+          bestLength = length;
+          bestDistance = distance;
+          if (length === limit) break;
+        }
+      }
+    }
+
+    if (bestLength >= 3) {
+      writeBits(1, 1);
+      writeBits(bestDistance - 1, 12);
+      writeBits(bestLength - 3, 8);
+      for (let i = 0; i < bestLength; i++) insert(position + i);
+      position += bestLength;
+    } else {
+      writeBits(0, 1);
+      writeBits(input[position], 8);
+      insert(position++);
+    }
+  }
+  if (pendingBits) output.push(pendingByte << (8 - pendingBits));
+  return Buffer.from(output);
+}
+
+function smallLzDecode(payload, outputSize) {
+  const output = Buffer.alloc(outputSize);
+  const totalBits = payload.length * 8;
+  let bitPosition = 0;
+  const readBits = count => {
+    if (bitPosition + count > totalBits) fail('invalid_archive', 'Обрезан короткий поток LZSS');
+    let value = 0;
+    for (let i = 0; i < count; i++) {
+      value = value * 2 + ((payload[bitPosition >>> 3] >>> (7 - (bitPosition & 7))) & 1);
+      bitPosition++;
+    }
+    return value;
+  };
+
+  let written = 0;
+  while (written < outputSize) {
+    if (readBits(1) === 0) {
+      output[written++] = readBits(8);
+      continue;
+    }
+    const distance = readBits(12) + 1;
+    const length = readBits(8) + 3;
+    if (distance > written || written + length > outputSize) fail('invalid_archive', 'Некорректная ссылка короткого LZSS');
+    for (let i = 0; i < length; i++) {
+      output[written] = output[written - distance];
+      written++;
+    }
+  }
+
+  const paddingBits = totalBits - bitPosition;
+  if (paddingBits > 7) fail('invalid_archive', 'Лишние данные короткого LZSS');
+  if (paddingBits && readBits(paddingBits) !== 0) fail('invalid_archive', 'Некорректное заполнение короткого LZSS');
+  return output;
+}
+
 // Mixed RLE: a varint stores length*2 + kind. Kind 0 is a literal span;
 // kind 1 is a repeated byte. Unlike pair-only RLE, random prefixes and isolated
 // noise bytes don't cost two bytes per input byte. Never grow past the current
@@ -678,6 +779,13 @@ export function compress(inputData) {
   // cannot be a valid archive: the decompressor would have no way to tell an
   // empty file from a missing/truncated request.
   if (input.length === 0) return Buffer.from([0]);
+  // Compact one-byte records: 0x00 remains reserved for the empty file and
+  // header bytes 0xf0..0xff use an escape record.
+  if (input.length === 1) {
+    return input[0] > 0 && input[0] < 0xf0
+      ? Buffer.from([input[0]])
+      : Buffer.from([COMPACT_ONE_BYTE_MARKER, input[0]]);
+  }
   const checksum = sha256(input);
   let best = { method: 0, params: Buffer.alloc(0), payload: input, total: input.length + 5 };
 
@@ -767,6 +875,11 @@ export function compress(inputData) {
       if (total < best.total) best = { method: 10, params: Buffer.alloc(0), payload: mixed, total };
     }
   }
+  if (input.length <= 4096) {
+    const smallLz = smallLzEncode(input);
+    const smallLzTotal = encodedSize(12, Buffer.alloc(0), smallLz);
+    if (smallLzTotal < best.total) best = { method: 12, params: Buffer.alloc(0), payload: smallLz, total: smallLzTotal };
+  }
   return createArchive(best.method, input, best.params, best.payload, checksum);
 }
 
@@ -836,7 +949,7 @@ function readHeader(archive) {
 function readV3Header(archive) {
   if (archive.length < 5) fail('invalid_archive', 'Обрезан компактный заголовок');
   const method = archive[0] - 0xf0;
-  if (![0, 1, 2, 3, 4, 5, 6, 9, 10, 11].includes(method)) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
+  if (![0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12].includes(method)) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
   if (method === 0) {
     const originalSize = archive.length - 5;
     return { legacy: false, v2: false, compact: true, method, originalSize, params: Buffer.alloc(0), payload: archive.subarray(5), checksum: archive.subarray(1, 5) };
@@ -946,9 +1059,8 @@ function parseHuffman(header) {
 export function decompress(archiveData) {
   const archive = Buffer.isBuffer(archiveData) ? archiveData : Buffer.from(archiveData);
   if (archive.length === 1 && archive[0] === 0) return Buffer.alloc(0);
-  if (archive.length === 1 && archive[0] >= 0xf0 && archive[0] <= 0xf5) {
-    fail('invalid_archive', 'Обрезан компактный архив');
-  }
+  if (archive.length === 1 && archive[0] > 0 && archive[0] < 0xf0) return Buffer.from([archive[0]]);
+  if (archive.length === 2 && archive[0] === COMPACT_ONE_BYTE_MARKER) return Buffer.from([archive[1]]);
   let header = readHeader(archive);
   if (header.method === 11) header = expandCompactHeader(header);
   let output;
@@ -969,6 +1081,8 @@ export function decompress(archiveData) {
     output = lzssDecode(header.payload, header.originalSize);
   } else if (header.method === 10) {
     output = mixedRleDecode(header.payload, header.originalSize);
+  } else if (header.method === 12) {
+    output = smallLzDecode(header.payload, header.originalSize);
   } else if (header.method === 2) {
     const huffman = parseHuffman(header);
     if (huffman.decodedSize !== header.originalSize) fail('invalid_archive', 'Размер Хаффмана не совпадает с исходным');
@@ -997,7 +1111,7 @@ export const formatInfo = {
   version: VERSION,
   headerSize: 5,
   storeHeaderSize: 5,
-  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman' }
+  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman', 12: 'small-lz' }
 };
 
-export const _testInternals = { lzssEncode, lzssDecode, buildHuffman, decodeHuffman };
+export const _testInternals = { lzssEncode, lzssDecode, smallLzEncode, smallLzDecode, buildHuffman, decodeHuffman };
