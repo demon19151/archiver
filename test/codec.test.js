@@ -134,6 +134,28 @@ test('small-file bit-packed LZSS round-trips and rejects truncated streams', () 
   assert.throws(() => decompress(archive.subarray(0, -1)), ArchiveError);
 });
 
+test('English prose dictionary improves repeated-word text without changing bytes', () => {
+  const paragraphs = [
+    'The report describes how the archive is built and how the restored file can be checked. Each section uses familiar words, punctuation, and short examples to explain the result. The program looks for repeated sequences, then stores the dictionary needed to rebuild the original bytes. ',
+    'A reader can follow the steps, compare the source with the output, and verify that no information has changed. Repeated phrases are common in ordinary writing, although their positions and lengths vary from one paragraph to another. This gives a compressor useful patterns to find. '
+  ];
+  const input = Buffer.from(Array.from({ length: 100 }, (_, i) => `${paragraphs[i % 2]}Section ${i}: the compression result must preserve every original byte.\n`).join(''));
+  const archive = compress(input);
+  assert.equal(archive[0], 0xfb, 'a compressed method should be selected for repeated English prose');
+  assert.ok(archive.length < input.length * 0.04, `archive was ${archive.length} bytes for ${input.length} bytes`);
+  assert.deepEqual(decompress(archive), input);
+  assert.throws(() => decompress(archive.subarray(0, -1)), ArchiveError);
+});
+
+test('word-dictionary decoder validates malformed tokens and indexes', () => {
+  const input = Buffer.from(('The archive stores the original bytes. Each repeated phrase can use a compact word dictionary.\n').repeat(300));
+  const archive = compress(input);
+  assert.notEqual(archive[0], 0xf0);
+  const brokenIndex = Buffer.from(archive);
+  brokenIndex[brokenIndex.length - 1] ^= 0x40;
+  assert.throws(() => decompress(brokenIndex), ArchiveError);
+});
+
 test('mixed RLE preserves literal spans and runs with strict bounds', () => {
   const input = Buffer.from('abzzzzzz!');
   const payload = Buffer.from([4, 97, 98, 13, 122, 2, 33]);

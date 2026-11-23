@@ -626,6 +626,145 @@ function smallLzDecode(payload, outputSize) {
   return output;
 }
 
+function isAsciiLetter(byte) {
+  return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122);
+}
+
+function wordDictionary(input) {
+  const counts = new Map();
+  let position = 0;
+  while (position < input.length) {
+    if (!isAsciiLetter(input[position])) {
+      position++;
+      continue;
+    }
+    const start = position++;
+    while (position < input.length && isAsciiLetter(input[position])) position++;
+    const length = position - start;
+    if (length < 3) continue;
+    const word = input.subarray(start, position).toString('ascii');
+    counts.set(word, (counts.get(word) || 0) + 1);
+  }
+
+  return [...counts.entries()]
+    .filter(([word, count]) => count >= 2)
+    .map(([word, count]) => ({
+      word: Buffer.from(word, 'ascii'),
+      count,
+      gain: (word.length - 2) * count - word.length - writeVarUint(word.length).length
+    }))
+    .filter(entry => entry.gain > 0)
+    .sort((a, b) => b.gain - a.gain || b.count - a.count || b.word.length - a.word.length)
+    .slice(0, 255)
+    .map(entry => entry.word);
+}
+
+function wordDictionaryEncode(input, searchLimit) {
+  const dictionary = wordDictionary(input);
+  if (!dictionary.length) return null;
+  const indexes = new Map(dictionary.map((word, index) => [word.toString('ascii'), index]));
+  const tokens = [];
+  let literalStart = 0;
+  let position = 0;
+  while (position < input.length) {
+    if (!isAsciiLetter(input[position])) {
+      position++;
+      continue;
+    }
+    const start = position++;
+    while (position < input.length && isAsciiLetter(input[position])) position++;
+    const index = indexes.get(input.subarray(start, position).toString('ascii'));
+    if (index === undefined) continue;
+    tokens.push(Buffer.from([0]), Buffer.from(writeVarUint(start - literalStart)), input.subarray(literalStart, start), Buffer.from([1]), Buffer.from(writeVarUint(index)));
+    literalStart = position;
+  }
+  tokens.push(Buffer.from([0]), Buffer.from(writeVarUint(input.length - literalStart)), input.subarray(literalStart));
+  const tokenStream = Buffer.concat(tokens);
+
+  const lz = lzssEncode(tokenStream, Math.max(searchLimit, 96));
+  let type = 0;
+  let params = Buffer.alloc(0);
+  let data = lz;
+  const huffman = buildHuffman(lz);
+  if (huffman) {
+    const full = huffmanParams(huffman);
+    const compact = compactHuffmanParams(1, full);
+    const choose = (candidateType, candidateParams) => {
+      const candidate = 1 + writeVarUint(candidateParams.length).length + candidateParams.length + huffman.data.length;
+      const current = 1 + writeVarUint(params.length).length + params.length + data.length;
+      if (candidate < current) {
+        type = candidateType;
+        params = candidateParams;
+        data = huffman.data;
+      }
+    };
+    choose(1, full);
+    if (compact && compact.length < full.length) choose(2, compact);
+  }
+
+  const header = [Buffer.from(writeVarUint(dictionary.length))];
+  for (const word of dictionary) header.push(Buffer.from(writeVarUint(word.length)), word);
+  header.push(Buffer.from(writeVarUint(tokenStream.length)), Buffer.from([type]), Buffer.from(writeVarUint(params.length)), params);
+  return Buffer.concat([...header, data]);
+}
+
+function wordDictionaryDecode(payload, outputSize) {
+  const state = { position: 0 };
+  const count = readVarUint(payload, state);
+  if (!count || count > 255) fail('invalid_archive', 'Некорректный словарь текста');
+  const dictionary = [];
+  for (let i = 0; i < count; i++) {
+    const length = readVarUint(payload, state);
+    if (length < 3 || length > payload.length - state.position) fail('invalid_archive', 'Некорректное слово в словаре');
+    dictionary.push(payload.subarray(state.position, state.position + length));
+    state.position += length;
+  }
+  const tokenSize = readVarUint(payload, state);
+  if (tokenSize > MAX_ORIGINAL_SIZE + Math.ceil(MAX_ORIGINAL_SIZE / 8) + 16 || state.position >= payload.length) {
+    fail('invalid_archive', 'Некорректный размер словарного потока');
+  }
+  const type = payload[state.position++];
+  const paramsLength = readVarUint(payload, state);
+  if (paramsLength > payload.length - state.position) fail('invalid_archive', 'Обрезаны параметры словарного потока');
+  let params = payload.subarray(state.position, state.position + paramsLength);
+  state.position += paramsLength;
+  let tokenStream;
+  if (type === 0) {
+    tokenStream = lzssDecode(payload.subarray(state.position), tokenSize);
+  } else if (type === 1 || type === 2) {
+    let header = { method: 1, params };
+    if (type === 2) header = expandCompactHeader(header);
+    const huffman = parseHuffman(header);
+    const lzStream = decodeHuffman(payload.subarray(state.position), huffman.lengths, huffman.decodedSize);
+    tokenStream = lzssDecode(lzStream, tokenSize);
+  } else {
+    fail('invalid_archive', 'Неизвестное кодирование словарного потока');
+  }
+
+  const output = Buffer.alloc(outputSize);
+  const tokenState = { position: 0 };
+  let written = 0;
+  while (tokenState.position < tokenStream.length) {
+    const kind = tokenStream[tokenState.position++];
+    if (kind === 0) {
+      const length = readVarUint(tokenStream, tokenState);
+      if (length > tokenStream.length - tokenState.position || length > outputSize - written) fail('invalid_archive', 'Обрезан литеральный текстовый блок');
+      tokenStream.copy(output, written, tokenState.position, tokenState.position + length);
+      tokenState.position += length;
+      written += length;
+    } else if (kind === 1) {
+      const index = readVarUint(tokenStream, tokenState);
+      if (index >= dictionary.length || dictionary[index].length > outputSize - written) fail('invalid_archive', 'Некорректная ссылка на слово');
+      dictionary[index].copy(output, written);
+      written += dictionary[index].length;
+    } else {
+      fail('invalid_archive', 'Неизвестный токен словарного текста');
+    }
+  }
+  if (written !== outputSize) fail('invalid_archive', 'Словарный поток не совпадает с размером файла');
+  return output;
+}
+
 // Mixed RLE: a varint stores length*2 + kind. Kind 0 is a literal span;
 // kind 1 is a repeated byte. Unlike pair-only RLE, random prefixes and isolated
 // noise bytes don't cost two bytes per input byte. Never grow past the current
@@ -730,6 +869,18 @@ function entropy(data) {
   return result;
 }
 
+function looksLikeAsciiText(input) {
+  const sample = input.subarray(0, Math.min(input.length, 32 * 1024));
+  if (sample.length < 128) return false;
+  let printable = 0;
+  let letters = 0;
+  for (const byte of sample) {
+    if ((byte >= 32 && byte <= 126) || byte === 9 || byte === 10 || byte === 13) printable++;
+    if ((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)) letters++;
+  }
+  return printable / sample.length >= 0.96 && letters / sample.length >= 0.12;
+}
+
 function looksIncompressible(input) {
   if (input.length < 8192) return false;
   // Sample several regions: multimedia containers often start with a simple
@@ -831,14 +982,23 @@ export function compress(inputData) {
   // Keep the hash-chain effort proportional to file size. Deep matching is
   // useful for small text; on multi-megabyte files it disproportionately costs
   // CPU while bringing only marginal compression gains.
+  const textLike = looksLikeAsciiText(input);
   const searchLimit = input.length < 64 * 1024 ? 48 : input.length < 1024 * 1024 ? 24 : input.length < 8 * 1024 * 1024 ? 12 : 6;
-  const lz = lzssEncode(input, searchLimit);
-  const rawLzTotal = encodedSize(9, Buffer.alloc(0), lz);
-  if (rawLzTotal < best.total) best = { method: 9, params: Buffer.alloc(0), payload: lz, total: rawLzTotal };
-  const lzHuffman = buildHuffman(lz);
-  if (lzHuffman) {
-    const params = huffmanParams(lzHuffman);
-    considerHuffman(1, params, lzHuffman.data);
+  // ASCII prose can have many equally valid matches. Try the normal shallow
+  // chain and one deeper chain, then keep the shorter archive. This avoids
+  // making varied prose worse while still helping text with distant repeats.
+  const searchLimits = textLike && input.length < 1024 * 1024
+    ? [searchLimit, 96]
+    : [searchLimit];
+  for (const limit of new Set(searchLimits)) {
+    const lz = lzssEncode(input, limit);
+    const rawLzTotal = encodedSize(9, Buffer.alloc(0), lz);
+    if (rawLzTotal < best.total) best = { method: 9, params: Buffer.alloc(0), payload: lz, total: rawLzTotal };
+    const lzHuffman = buildHuffman(lz);
+    if (lzHuffman) {
+      const params = huffmanParams(lzHuffman);
+      considerHuffman(1, params, lzHuffman.data);
+    }
   }
 
   const directHuffman = buildHuffman(input);
@@ -879,6 +1039,13 @@ export function compress(inputData) {
     const smallLz = smallLzEncode(input);
     const smallLzTotal = encodedSize(12, Buffer.alloc(0), smallLz);
     if (smallLzTotal < best.total) best = { method: 12, params: Buffer.alloc(0), payload: smallLz, total: smallLzTotal };
+  }
+  if (textLike && input.length >= 16 * 1024 && input.length <= 256 * 1024) {
+    const wordPayload = wordDictionaryEncode(input, searchLimit);
+    if (wordPayload) {
+      const wordTotal = encodedSize(14, Buffer.alloc(0), wordPayload);
+      if (wordTotal < best.total) best = { method: 14, params: Buffer.alloc(0), payload: wordPayload, total: wordTotal };
+    }
   }
   return createArchive(best.method, input, best.params, best.payload, checksum);
 }
@@ -949,7 +1116,7 @@ function readHeader(archive) {
 function readV3Header(archive) {
   if (archive.length < 5) fail('invalid_archive', 'Обрезан компактный заголовок');
   const method = archive[0] - 0xf0;
-  if (![0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12].includes(method)) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
+  if (![0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 14].includes(method)) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
   if (method === 0) {
     const originalSize = archive.length - 5;
     return { legacy: false, v2: false, compact: true, method, originalSize, params: Buffer.alloc(0), payload: archive.subarray(5), checksum: archive.subarray(1, 5) };
@@ -1083,6 +1250,8 @@ export function decompress(archiveData) {
     output = mixedRleDecode(header.payload, header.originalSize);
   } else if (header.method === 12) {
     output = smallLzDecode(header.payload, header.originalSize);
+  } else if (header.method === 14) {
+    output = wordDictionaryDecode(header.payload, header.originalSize);
   } else if (header.method === 2) {
     const huffman = parseHuffman(header);
     if (huffman.decodedSize !== header.originalSize) fail('invalid_archive', 'Размер Хаффмана не совпадает с исходным');
@@ -1111,7 +1280,7 @@ export const formatInfo = {
   version: VERSION,
   headerSize: 5,
   storeHeaderSize: 5,
-  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman', 12: 'small-lz' }
+  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman', 12: 'small-lz', 14: 'word-dictionary' }
 };
 
-export const _testInternals = { lzssEncode, lzssDecode, smallLzEncode, smallLzDecode, buildHuffman, decodeHuffman };
+export const _testInternals = { lzssEncode, lzssDecode, smallLzEncode, smallLzDecode, wordDictionaryEncode, buildHuffman, decodeHuffman };

@@ -26,6 +26,7 @@ const cases = [
   ['small-431-ru', Buffer.from('Маленький текстовый файл для проверки сжатия. '.repeat(20)).subarray(0, 431)],
   ['small-1000-ru', Buffer.from('Маленький текстовый файл для проверки сжатия. '.repeat(30)).subarray(0, 1000)],
   ['short-en', Buffer.from('A lossless archive preserves every byte. Select your files, compress them, and download the result. The decoder restores the original bytes using the dictionary stored in the archive. No external data is required.')],
+  ['english-varied-prose-245k', Buffer.from(Array.from({ length: 100 }, (_, i) => `${i % 2 ? 'The report describes how an archive is built and checked. Each section uses familiar words, punctuation, and examples. The program looks for repeated sequences and stores a dictionary to rebuild the original bytes. ' : 'A reader can follow the steps, compare source and output, and verify no information changed. Repeated phrases are common in ordinary writing, though their positions and lengths vary between paragraphs. '}Section ${i}: every original byte must be preserved.\n`).join(''))],
   ['text-ru', Buffer.concat(Array.from({ length: 300 }, (_, i) => Buffer.concat([shortText, Buffer.from(`${i}\n`)])))],
   ['csv', Buffer.from(Array.from({ length: 5000 }, (_, i) => `${i},Москва,${i % 100},active\n`).join(''))],
   ['json', Buffer.from(JSON.stringify(Array.from({ length: 4000 }, (_, id) => ({ id, name: 'item', active: true }))))],
