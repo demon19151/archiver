@@ -16,6 +16,16 @@ const TOKEN_WINDOW_SIZE = 256 * 1024;
 const MAX_DISTANCE_SLOT = 18;
 const MAX_MATCH = 258;
 const CONTEXT_BLOCK_SIZE = 128 * 1024;
+const RECORD_STRIDES = [...new Set([
+  ...Array.from({ length: 63 }, (_, index) => 4 + index * 4),
+  ...Array.from({ length: 16 }, (_, index) => 256 + (index + 1) * 16),
+  256, 640, 768, 1024, 2048, 4096
+])].sort((a, b) => a - b);
+
+function recordStrideFromTransform(id) {
+  if (!Number.isInteger(id) || id < 16 || id >= 16 + RECORD_STRIDES.length) return 0;
+  return RECORD_STRIDES[id - 16];
+}
 
 export class ArchiveError extends Error {
   constructor(code, message, status = 400) {
@@ -120,6 +130,7 @@ function lzssDecode(stream, outputSize) {
   while (outputPosition < outputSize) {
     if (inputPosition >= stream.length) fail('invalid_archive', 'Обрезан поток LZSS');
     const flags = stream[inputPosition++];
+    if (outputSize - outputPosition > 8 && inputPosition >= stream.length) fail('invalid_archive', 'Обрезан поток LZSS');
     for (let bit = 0; bit < 8 && outputPosition < outputSize; bit++) {
       if (flags & (1 << bit)) {
         if (inputPosition >= stream.length) fail('invalid_archive', 'Обрезан литеральный токен');
@@ -654,7 +665,9 @@ function lzTokenHuffmanDecode(payload, params, outputSize, maxDistance = WINDOW_
 }
 
 function numericTransform(input, id, inverse = false) {
-  if (![8, 9, 10, 11].includes(id)) fail('invalid_archive', 'Неизвестный числовой фильтр');
+  const recordStride = recordStrideFromTransform(id);
+  if (![8, 9, 10, 11].includes(id) && !recordStride) fail('invalid_archive', 'Неизвестный числовой фильтр');
+  if (recordStride) return inverse ? restoreDeltaStride(Buffer.from(input), recordStride) : deltaStride(input, recordStride);
   const stride = id <= 9 ? 2 : 4;
   const order = id % 2 === 0 ? 1 : 2;
   return inverse
@@ -741,6 +754,8 @@ function applyTransform(input, id) {
   if (id === 5) return deltaEncode(byteShuffle(input, 2));
   if (id === 6) return deltaEncode(byteShuffle(input, 4));
   if (id === 7) return deltaStride(input, 4096);
+  const recordStride = recordStrideFromTransform(id);
+  if (recordStride) return deltaStride(input, recordStride);
   fail('invalid_archive', 'Неизвестное преобразование данных');
 }
 
@@ -750,6 +765,8 @@ function reverseTransform(input, id) {
   if (id === 5) return byteUnshuffle(deltaDecode(input), 2, input.length);
   if (id === 6) return byteUnshuffle(deltaDecode(input), 4, input.length);
   if (id === 7) return restoreDeltaStride(Buffer.from(input), 4096);
+  const recordStride = recordStrideFromTransform(id);
+  if (recordStride) return restoreDeltaStride(Buffer.from(input), recordStride);
   fail('invalid_archive', 'Неизвестное преобразование данных');
 }
 
@@ -759,15 +776,45 @@ function chooseTransform(input) {
   const sample = input.subarray(0, sampleSize);
   const originalEntropy = entropy(sample);
   let best = { id: 0, gain: 0 };
-  const candidates = [1, 2, 5, 6];
-  if (input.length >= 8192) candidates.push(7);
+  const candidates = [1, 2, 5, 6, 7];
   for (const id of candidates) {
-    const transformed = applyTransform(sample, id);
-    const gain = originalEntropy - entropy(transformed);
+    const gain = originalEntropy - entropy(applyTransform(sample, id));
     if (gain > best.gain) best = { id, gain };
   }
   const minimumGain = input.length >= 8 * 1024 * 1024 ? 0.25 : 0.08;
   return best.gain >= minimumGain ? best.id : 0;
+}
+
+function chooseRecordStride(input) {
+  if (input.length < 8 * 1024 || input.length > 2 * 1024 * 1024) return 0;
+  const sampleSize = Math.min(input.length, 8192);
+  const center = Math.floor((input.length - sampleSize) / 2);
+  let bestStride = 0;
+  let bestGain = 0.35;
+  const strideGains = new Map();
+  for (const stride of RECORD_STRIDES) {
+    if (stride > sampleSize / 2) continue;
+    const alignedSamples = [
+      input.subarray(0, sampleSize),
+      input.subarray(Math.floor(center / stride) * stride, Math.floor(center / stride) * stride + sampleSize),
+      input.subarray(Math.floor((input.length - sampleSize) / stride) * stride, Math.floor((input.length - sampleSize) / stride) * stride + sampleSize)
+    ];
+    const gains = alignedSamples.map(sample => entropy(sample) - entropy(deltaStride(sample, stride)));
+    gains.sort((a, b) => a - b);
+    const stableGain = gains[0];
+    strideGains.set(stride, stableGain);
+    if (stableGain > bestGain) {
+      bestGain = stableGain;
+      bestStride = stride;
+    }
+  }
+  if (!bestStride) return 0;
+  // Prefer the smallest plausible row period when a larger multiple produces
+  // a nearly equal score; the unscaled delta is usually more compact then.
+  for (const stride of RECORD_STRIDES) {
+    if (stride <= bestStride && strideGains.has(stride) && strideGains.get(stride) >= bestGain - 0.25) return stride;
+  }
+  return bestStride;
 }
 
 function writeVarUint(value) {
@@ -1514,7 +1561,9 @@ export function compress(inputData) {
   }
 
   const wordTransformId = chooseWordTransform(input);
-  const incompressible = !wordTransformId && looksIncompressible(input);
+  const transformId = chooseTransform(input);
+  const recordStride = chooseRecordStride(input);
+  const incompressible = !wordTransformId && !transformId && !recordStride && looksIncompressible(input);
   if (incompressible) {
     // Entropy probes can miss a repeated region when the duplicated pages are
     // farther apart than the regular LZ window. Make one bounded wide-window
@@ -1569,7 +1618,6 @@ export function compress(inputData) {
     considerHuffman(2, params, directHuffman.data);
   }
 
-  const transformId = chooseTransform(input);
   if (!transformId && shouldTryDelta(input)) {
     const delta = deltaEncode(input);
     const deltaLz = lzssEncode(delta, searchLimit);
@@ -1595,6 +1643,20 @@ export function compress(inputData) {
     if (mixed) {
       const total = headerSize + mixed.length;
       if (total < best.total) best = { method: 10, params: Buffer.alloc(0), payload: mixed, total };
+    }
+  }
+  if (recordStride && input.length >= 8 * 1024 && input.length <= 2 * 1024 * 1024) {
+    const stride = recordStride;
+    const transformId = 16 + RECORD_STRIDES.indexOf(stride);
+    const transformed = deltaStride(input, stride);
+    const encoded = buildHuffman(transformed);
+    if (encoded) {
+      considerHuffman(6, Buffer.concat([Buffer.from([transformId]), huffmanParams(encoded)]), encoded.data);
+    }
+    const payload = Buffer.concat([Buffer.from(writeVarUint(stride)), contextBlocksEncode(transformed, 512 * 1024)]);
+    const total = encodedSize(7, Buffer.alloc(0), payload);
+    if (total < best.total) {
+      best = { method: 7, params: Buffer.alloc(0), payload, total };
     }
   }
   if (input.length <= 4096) {
@@ -1695,7 +1757,7 @@ function readHeader(archive) {
 function readV3Header(archive) {
   if (archive.length < 5) fail('invalid_archive', 'Обрезан компактный заголовок');
   const method = archive[0] - 0xf0;
-  if (![0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15].includes(method)) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
+  if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].includes(method)) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
   if (method === 0) {
     const originalSize = archive.length - 5;
     return { legacy: false, v2: false, compact: true, method, originalSize, params: Buffer.alloc(0), payload: archive.subarray(5), checksum: archive.subarray(1, 5) };
@@ -1776,7 +1838,7 @@ function parseHuffman(header) {
   if (header.method === 6 && !header.v2 && !header.legacy) {
     if (header.params.length < 1) fail('invalid_archive', 'Отсутствует идентификатор преобразования');
     const transformId = header.params[0];
-    if (![1, 2, 5, 6, 7].includes(transformId)) fail('invalid_archive', 'Неизвестное преобразование данных');
+    if (![1, 2, 5, 6, 7].includes(transformId) && !recordStrideFromTransform(transformId)) fail('invalid_archive', 'Неизвестное преобразование данных');
     return { ...parseHuffman({ ...header, method: 1, params: header.params.subarray(1) }), transformId };
   }
   if (header.legacy) {
@@ -1832,6 +1894,11 @@ export function decompress(archiveData) {
     const params = header.payload.subarray(state.position, state.position + paramsLength);
     state.position += paramsLength;
     output = lzTokenHuffmanDecode(header.payload.subarray(state.position), params, header.originalSize, maxDistance);
+  } else if (header.method === 7) {
+    const state = { position: 0 };
+    const stride = readVarUint(header.payload, state);
+    if (!RECORD_STRIDES.includes(stride)) fail('invalid_archive', 'Некорректный шаг бинарных записей');
+    output = restoreDeltaStride(contextBlocksDecode(header.payload.subarray(state.position), header.originalSize), stride);
   } else if (header.method === 9) {
     output = lzssDecode(header.payload, header.originalSize);
   } else if (header.method === 10) {
@@ -1844,7 +1911,7 @@ export function decompress(archiveData) {
     output = contextBlocksDecode(header.payload, header.originalSize);
   } else if (header.method === 15) {
     const id = header.payload[0];
-    if (![8, 9, 10, 11].includes(id)) fail('invalid_archive', 'Неизвестный числовой фильтр');
+    if (![8, 9, 10, 11].includes(id) && !recordStrideFromTransform(id)) fail('invalid_archive', 'Неизвестный числовой фильтр');
     output = numericTransform(contextBlocksDecode(header.payload.subarray(1), header.originalSize), id, true);
   } else if (header.method === 2) {
     const huffman = parseHuffman(header);
@@ -1874,7 +1941,7 @@ export const formatInfo = {
   version: VERSION,
   headerSize: 5,
   storeHeaderSize: 5,
-  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 8: 'lz-token+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman', 12: 'small-lz', 13: 'bwt+mtf+huffman', 14: 'word-dictionary', 15: 'word-delta+bwt' }
+  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 7: 'record-delta+bwt', 8: 'lz-token+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman', 12: 'small-lz', 13: 'bwt+mtf+huffman', 14: 'word-dictionary', 15: 'word-delta+bwt' }
 };
 
-export const _testInternals = { lzssEncode, lzssDecode, smallLzEncode, smallLzDecode, wordDictionaryEncode, bwtEncode, bwtDecode, mtfRunsEncode, mtfRunsDecode, contextBlocksEncode, contextBlocksDecode, numericTransform, buildHuffman, decodeHuffman, lzTokenHuffmanEncode, lzTokenHuffmanDecode };
+export const _testInternals = { lzssEncode, lzssDecode, smallLzEncode, smallLzDecode, wordDictionaryEncode, bwtEncode, bwtDecode, mtfRunsEncode, mtfRunsDecode, contextBlocksEncode, contextBlocksDecode, numericTransform, buildHuffman, decodeHuffman, lzTokenHuffmanEncode, lzTokenHuffmanDecode, chooseRecordStride };
