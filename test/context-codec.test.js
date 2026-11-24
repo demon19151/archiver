@@ -89,6 +89,13 @@ test('numeric filters are bit-exact with wraparound, odd sizes and short tails',
       }
     }
   }
+  for (let id = 16; id < 16 + 70; id++) {
+    for (const size of [0, 1, 19, 257, 4099]) {
+      const input = randomBytes(size, id * 17 + size);
+      const encoded = internals.numericTransform(input, id);
+      assert.deepEqual(internals.numericTransform(encoded, id, true), input, `transform ${id}, size ${size}`);
+    }
+  }
 });
 
 test('Huffman-coded LZ tokens round-trip literals, distances and long matches', () => {
@@ -145,6 +152,36 @@ test('16-bit numeric signal uses filtered compression and rejects invalid filter
   corrupt[position + 4] = 255;
   assert.throws(() => decompress(corrupt), ArchiveError);
   assert.throws(() => decompress(archive.subarray(0, -1)), ArchiveError);
+});
+
+test('record-period delta discovers 20-byte binary records and restores exact bytes', () => {
+  const input = Buffer.alloc(20 * 20480);
+  let state = 0x12345678;
+  const next = () => {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    return state >>> 0;
+  };
+  for (let at = 0; at < input.length; at += 20) {
+    const row = at / 20;
+    input.writeUInt32LE(row, at);
+    input.writeUInt32LE(row % 64, at + 4);
+    input.writeFloatLE(Math.sin(row / 16), at + 8);
+    input.writeUInt32LE(next() % 100000, at + 12);
+    input.writeUInt32LE(row % 3, at + 16);
+  }
+  assert.equal(internals.chooseRecordStride(input), 20);
+  const archive = compress(input);
+  assert.ok(archive.length < input.length * 0.5, `archive was ${archive.length}`);
+  assert.deepEqual(decompress(archive), input);
+});
+
+test('PNG-like high-entropy data stays byte-exact and is not replaced with lossy output', () => {
+  const input = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), randomBytes(64 * 1024, 7712)]);
+  const archive = compress(input);
+  assert.deepEqual(decompress(archive), input);
+  assert.ok(archive.length <= input.length + 5);
 });
 
 test('deterministic context fuzz round-trips through the public archive API', () => {
