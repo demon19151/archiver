@@ -13,6 +13,7 @@ const LEGACY_HEADER_SIZE = 64;
 const COMPACT_ONE_BYTE_MARKER = 0xfe;
 const WINDOW_SIZE = 65536;
 const MAX_MATCH = 258;
+const CONTEXT_BLOCK_SIZE = 128 * 1024;
 
 export class ArchiveError extends Error {
   constructor(code, message, status = 400) {
@@ -349,6 +350,48 @@ function createArchive(method, original, params, payload, checksum) {
   if (method === 0) return Buffer.concat([Buffer.from([0xf0]), checksum.subarray(0, 4), payload]);
   const prefix = Buffer.from([0xf0 + method, ...writeVarUint(original.length)]);
   return Buffer.concat([prefix, checksum.subarray(0, 4), params, payload]);
+}
+
+// Modular word deltas preserve every bit, including headers and odd tails.
+function wordDelta(input, stride, order, inverse = false) {
+  const output = Buffer.from(input);
+  for (let pass = 0; pass < order; pass++) {
+    let previous = 0;
+    for (let at = 0; at + stride <= output.length; at += stride) {
+      const value = stride === 2 ? output.readUInt16LE(at) : output.readUInt32LE(at);
+      const encoded = inverse ? (value + previous) >>> 0 : (value - previous) >>> 0;
+      if (stride === 2) output.writeUInt16LE(encoded & 0xffff, at);
+      else output.writeUInt32LE(encoded, at);
+      previous = inverse ? encoded : value;
+    }
+  }
+  return output;
+}
+
+function numericTransform(input, id, inverse = false) {
+  if (![8, 9, 10, 11].includes(id)) fail('invalid_archive', 'Неизвестный числовой фильтр');
+  const stride = id <= 9 ? 2 : 4;
+  const order = id % 2 === 0 ? 1 : 2;
+  return inverse
+    ? wordDelta(byteUnshuffle(input, stride, input.length), stride, order, true)
+    : byteShuffle(wordDelta(input, stride, order), stride);
+}
+
+function chooseWordTransform(input) {
+  if (input.length < 8192 || input.length > 2 * 1024 * 1024) return 0;
+  const size = Math.min(8192, input.length);
+  const starts = [0, Math.floor((input.length - size) / 2 / 4) * 4, Math.floor((input.length - size) / 4) * 4];
+  let best = { id: 0, gain: 0.35 };
+  for (const id of [8, 9, 10, 11]) {
+    let gain = 0;
+    for (const start of starts) {
+      const sample = input.subarray(start, start + size);
+      gain += entropy(sample) - entropy(numericTransform(sample, id));
+    }
+    gain /= starts.length;
+    if (gain > best.gain) best = { id, gain };
+  }
+  return best.id;
 }
 
 function deltaEncode(input) {
@@ -765,10 +808,216 @@ function wordDictionaryDecode(payload, outputSize) {
   return output;
 }
 
+// Cyclic suffix sorting with counting-sort doubling. Workspace is bounded by
+// one block, not the whole file; no platform compression library is used.
+function bwtEncode(input) {
+  const size = input.length;
+  if (!size) return { primary: 0, data: Buffer.alloc(0) };
+  const order = new Uint32Array(size);
+  const shifted = new Uint32Array(size);
+  let classes = new Uint32Array(size);
+  let nextClasses = new Uint32Array(size);
+  const counts = new Uint32Array(Math.max(256, size));
+  for (const byte of input) counts[byte]++;
+  let sum = 0;
+  for (let i = 0; i < 256; i++) {
+    const count = counts[i];
+    counts[i] = sum;
+    sum += count;
+  }
+  for (let i = 0; i < size; i++) order[counts[input[i]]++] = i;
+  let classCount = 1;
+  for (let i = 1; i < size; i++) {
+    if (input[order[i]] !== input[order[i - 1]]) classCount++;
+    classes[order[i]] = classCount - 1;
+  }
+  for (let width = 1; width < size && classCount < size; width *= 2) {
+    counts.fill(0, 0, classCount);
+    for (let i = 0; i < size; i++) {
+      const start = order[i] - width;
+      shifted[i] = start < 0 ? start + size : start;
+      counts[classes[shifted[i]]]++;
+    }
+    sum = 0;
+    for (let i = 0; i < classCount; i++) {
+      const count = counts[i];
+      counts[i] = sum;
+      sum += count;
+    }
+    for (let i = 0; i < size; i++) {
+      const start = shifted[i];
+      order[counts[classes[start]]++] = start;
+    }
+    let nextCount = 1;
+    nextClasses[order[0]] = 0;
+    for (let i = 1; i < size; i++) {
+      const current = order[i];
+      const previous = order[i - 1];
+      const currentEnd = current + width < size ? current + width : current + width - size;
+      const previousEnd = previous + width < size ? previous + width : previous + width - size;
+      if (classes[current] !== classes[previous] || classes[currentEnd] !== classes[previousEnd]) nextCount++;
+      nextClasses[current] = nextCount - 1;
+    }
+    [classes, nextClasses] = [nextClasses, classes];
+    classCount = nextCount;
+  }
+  const data = Buffer.allocUnsafe(size);
+  let primary = 0;
+  for (let i = 0; i < size; i++) {
+    const start = order[i];
+    if (start === 0) primary = i;
+    data[i] = input[start === 0 ? size - 1 : start - 1];
+  }
+  return { primary, data };
+}
+
+function bwtDecode(data, primary) {
+  if (!data.length || primary >= data.length) fail('invalid_archive', 'Некорректная позиция BWT');
+  const counts = new Uint32Array(256);
+  for (const byte of data) counts[byte]++;
+  let sum = 0;
+  for (let i = 0; i < 256; i++) {
+    const count = counts[i];
+    counts[i] = sum;
+    sum += count;
+  }
+  const next = new Uint32Array(data.length);
+  for (let i = 0; i < data.length; i++) next[counts[data[i]]++] = i;
+  const output = Buffer.allocUnsafe(data.length);
+  let row = primary;
+  for (let i = 0; i < output.length; i++) {
+    row = next[row];
+    output[i] = data[row];
+  }
+  return output;
+}
+
+// Move-to-front ranks, with zero runs stored as 0 followed by a varint.
+function mtfRunsEncode(input) {
+  const alphabet = Uint8Array.from({ length: 256 }, (_, i) => i);
+  const output = [];
+  let zeros = 0;
+  const flush = () => {
+    if (zeros) output.push(0, ...writeVarUint(zeros));
+    zeros = 0;
+  };
+  for (const byte of input) {
+    let rank = 0;
+    while (alphabet[rank] !== byte) rank++;
+    if (!rank) {
+      zeros++;
+      continue;
+    }
+    flush();
+    output.push(rank);
+    for (let i = rank; i > 0; i--) alphabet[i] = alphabet[i - 1];
+    alphabet[0] = byte;
+  }
+  flush();
+  return Buffer.from(output);
+}
+
+function mtfRunsDecode(input, outputSize) {
+  const alphabet = Uint8Array.from({ length: 256 }, (_, i) => i);
+  const output = Buffer.allocUnsafe(outputSize);
+  const state = { position: 0 };
+  let written = 0;
+  while (state.position < input.length) {
+    const rank = input[state.position++];
+    if (rank === 0) {
+      const length = readVarUint(input, state);
+      if (!length || length > outputSize - written) fail('invalid_archive', 'Некорректная серия MTF');
+      output.fill(alphabet[0], written, written + length);
+      written += length;
+    } else {
+      if (written >= outputSize) fail('invalid_archive', 'Лишние данные MTF');
+      const byte = alphabet[rank];
+      output[written++] = byte;
+      for (let i = rank; i > 0; i--) alphabet[i] = alphabet[i - 1];
+      alphabet[0] = byte;
+    }
+  }
+  if (written !== outputSize) fail('invalid_archive', 'Обрезан поток MTF');
+  return output;
+}
+
+function contextBlocksEncode(input, blockSize = CONTEXT_BLOCK_SIZE) {
+  const count = Math.ceil(input.length / blockSize);
+  const parts = [Buffer.from(writeVarUint(blockSize)), Buffer.from(writeVarUint(count))];
+  for (let start = 0; start < input.length; start += blockSize) {
+    const block = input.subarray(start, Math.min(input.length, start + blockSize));
+    const bwt = bwtEncode(block);
+    const runs = mtfRunsEncode(bwt.data);
+    const huffman = buildHuffman(runs);
+    const raw = Buffer.concat([Buffer.from([0]), Buffer.from(writeVarUint(block.length)), block]);
+    let chosen = raw;
+    if (huffman) {
+      const full = huffmanParams(huffman);
+      const compact = compactHuffmanParams(2, full);
+      const params = compact && compact.length < full.length ? compact : full;
+      const mode = params === full ? 2 : 1;
+      const compressed = Buffer.concat([
+        Buffer.from([mode]), Buffer.from(writeVarUint(block.length)),
+        Buffer.from(writeVarUint(bwt.primary)), Buffer.from(writeVarUint(params.length)), params,
+        Buffer.from(writeVarUint(huffman.data.length)), huffman.data
+      ]);
+      if (compressed.length < raw.length) chosen = compressed;
+    }
+    parts.push(chosen);
+  }
+  return Buffer.concat(parts);
+}
+
+function contextBlocksDecode(payload, outputSize) {
+  const state = { position: 0 };
+  const blockSize = readVarUint(payload, state);
+  if (![32, 64, 128, 256, 512].some(size => size * 1024 === blockSize)) fail('invalid_archive', 'Недопустимый размер блока BWT');
+  const count = readVarUint(payload, state);
+  if (count !== Math.ceil(outputSize / blockSize) || !count) fail('invalid_archive', 'Некорректное число блоков BWT');
+  const output = Buffer.allocUnsafe(outputSize);
+  let written = 0;
+  for (let i = 0; i < count; i++) {
+    if (state.position >= payload.length) fail('invalid_archive', 'Обрезан заголовок блока BWT');
+    const mode = payload[state.position++];
+    const length = readVarUint(payload, state);
+    if (length !== Math.min(blockSize, outputSize - written)) fail('invalid_archive', 'Некорректный размер блока BWT');
+    if (mode === 0) {
+      if (length > payload.length - state.position) fail('invalid_archive', 'Обрезан блок хранения BWT');
+      payload.copy(output, written, state.position, state.position + length);
+      state.position += length;
+    } else if (mode === 1 || mode === 2) {
+      const primary = readVarUint(payload, state);
+      const paramsLength = readVarUint(payload, state);
+      if (primary >= length || paramsLength > 1024 || paramsLength > payload.length - state.position) fail('invalid_archive', 'Некорректный заголовок BWT');
+      const params = payload.subarray(state.position, state.position + paramsLength);
+      state.position += paramsLength;
+      // Validate the compact header before expanding it: the generic helper
+      // assumes that its caller already checked the size and symbol count.
+      if (mode === 1) {
+        if (params.length < 7 || params[0] !== 2) fail('invalid_archive', 'Некорректная таблица блока BWT');
+        const symbols = params.readUInt16LE(5);
+        if (!symbols || symbols > 256 || params.length !== 7 + symbols + Math.ceil(symbols / 2)) fail('invalid_archive', 'Обрезана таблица блока BWT');
+      }
+      const header = mode === 1 ? expandCompactHeader({ params }) : { params, method: 2 };
+      const huffman = parseHuffman(header);
+      if (!huffman.decodedSize || huffman.decodedSize > length * 2 + 8) fail('invalid_archive', 'Слишком большой поток MTF');
+      const dataLength = readVarUint(payload, state);
+      if (dataLength > payload.length - state.position) fail('invalid_archive', 'Обрезаны данные блока BWT');
+      const runs = decodeHuffman(payload.subarray(state.position, state.position + dataLength), huffman.lengths, huffman.decodedSize);
+      state.position += dataLength;
+      bwtDecode(mtfRunsDecode(runs, length), primary).copy(output, written);
+    } else {
+      fail('invalid_archive', 'Неизвестный режим блока BWT');
+    }
+    written += length;
+  }
+  if (state.position !== payload.length) fail('invalid_archive', 'Лишние данные блоков BWT');
+  return output;
+}
+
 // Mixed RLE: a varint stores length*2 + kind. Kind 0 is a literal span;
-// kind 1 is a repeated byte. Unlike pair-only RLE, random prefixes and isolated
-// noise bytes don't cost two bytes per input byte. Never grow past the current
-// best candidate's budget.
+// kind 1 is a repeated byte. Random prefixes and isolated noise bytes don't
+// cost two bytes per input byte. Never exceed the current winner's budget.
 function mixedRleEncode(input, budget) {
   if (budget < 3) return null;
   const output = Buffer.allocUnsafe(Math.min(input.length, budget));
@@ -969,7 +1218,8 @@ export function compress(inputData) {
     return createArchive(best.method, input, best.params, best.payload, checksum);
   }
 
-  if (looksIncompressible(input)) {
+  const wordTransformId = chooseWordTransform(input);
+  if (!wordTransformId && looksIncompressible(input)) {
     return createArchive(0, input, Buffer.alloc(0), input, checksum);
   }
 
@@ -1047,6 +1297,23 @@ export function compress(inputData) {
       if (wordTotal < best.total) best = { method: 14, params: Buffer.alloc(0), payload: wordPayload, total: wordTotal };
     }
   }
+  // A separate context-sorting candidate helps diverse prose and structured
+  // binary that don't have long exact LZ matches. Keep all previous winners.
+  if (input.length >= 256 && input.length <= 2 * 1024 * 1024 && best.total > input.length * 0.03) {
+    for (const blockSize of [128, 512]) {
+      const contextPayload = contextBlocksEncode(input, blockSize * 1024);
+      const total = encodedSize(13, Buffer.alloc(0), contextPayload);
+      if (total < best.total) best = { method: 13, params: Buffer.alloc(0), payload: contextPayload, total };
+    }
+  }
+  if (wordTransformId) {
+    const transformed = numericTransform(input, wordTransformId);
+    for (const blockSize of [128, 512]) {
+      const payload = Buffer.concat([Buffer.from([wordTransformId]), contextBlocksEncode(transformed, blockSize * 1024)]);
+      const total = encodedSize(15, Buffer.alloc(0), payload);
+      if (total < best.total) best = { method: 15, params: Buffer.alloc(0), payload, total };
+    }
+  }
   return createArchive(best.method, input, best.params, best.payload, checksum);
 }
 
@@ -1116,7 +1383,7 @@ function readHeader(archive) {
 function readV3Header(archive) {
   if (archive.length < 5) fail('invalid_archive', 'Обрезан компактный заголовок');
   const method = archive[0] - 0xf0;
-  if (![0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 14].includes(method)) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
+  if (![0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15].includes(method)) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
   if (method === 0) {
     const originalSize = archive.length - 5;
     return { legacy: false, v2: false, compact: true, method, originalSize, params: Buffer.alloc(0), payload: archive.subarray(5), checksum: archive.subarray(1, 5) };
@@ -1252,6 +1519,12 @@ export function decompress(archiveData) {
     output = smallLzDecode(header.payload, header.originalSize);
   } else if (header.method === 14) {
     output = wordDictionaryDecode(header.payload, header.originalSize);
+  } else if (header.method === 13) {
+    output = contextBlocksDecode(header.payload, header.originalSize);
+  } else if (header.method === 15) {
+    const id = header.payload[0];
+    if (![8, 9, 10, 11].includes(id)) fail('invalid_archive', 'Неизвестный числовой фильтр');
+    output = numericTransform(contextBlocksDecode(header.payload.subarray(1), header.originalSize), id, true);
   } else if (header.method === 2) {
     const huffman = parseHuffman(header);
     if (huffman.decodedSize !== header.originalSize) fail('invalid_archive', 'Размер Хаффмана не совпадает с исходным');
@@ -1280,7 +1553,7 @@ export const formatInfo = {
   version: VERSION,
   headerSize: 5,
   storeHeaderSize: 5,
-  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman', 12: 'small-lz', 14: 'word-dictionary' }
+  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman', 12: 'small-lz', 13: 'bwt+mtf+huffman', 14: 'word-dictionary', 15: 'word-delta+bwt' }
 };
 
-export const _testInternals = { lzssEncode, lzssDecode, smallLzEncode, smallLzDecode, wordDictionaryEncode, buildHuffman, decodeHuffman };
+export const _testInternals = { lzssEncode, lzssDecode, smallLzEncode, smallLzDecode, wordDictionaryEncode, bwtEncode, bwtDecode, mtfRunsEncode, mtfRunsDecode, contextBlocksEncode, contextBlocksDecode, numericTransform, buildHuffman, decodeHuffman };

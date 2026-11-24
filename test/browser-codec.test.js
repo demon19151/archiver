@@ -8,6 +8,7 @@ import { createContext, runInContext } from 'node:vm';
 import { performance } from 'node:perf_hooks';
 import { buildBrowser } from '../scripts/build-browser.js';
 import { compress, decompress } from '../src/codec.js';
+import { compressionFixtures } from '../fixtures/compression.js';
 
 test('browser worker produces server-compatible archives, including large files', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'opencode', 'browser-codec-'));
@@ -36,6 +37,11 @@ test('browser worker produces server-compatible archives, including large files'
       randomBytes(1024 * 1024),
       Buffer.concat([Buffer.from('II*\0'), Buffer.alloc(8 * 1024 * 1024, 37)])
     ];
+    // Exercise new block methods and multi-block decoding in the bundled code,
+    // not only the Node implementation.
+    for (const [name, input] of compressionFixtures()) {
+      if (['csv-varied', 'pcm16-signal'].includes(name)) cases.push(input);
+    }
     for (const input of cases) {
       const browserArchive = callWorker('compress', input);
       assert.deepEqual(browserArchive, compress(input), 'browser and server archives must match');
