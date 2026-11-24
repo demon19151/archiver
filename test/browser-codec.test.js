@@ -34,6 +34,8 @@ test('browser worker produces server-compatible archives, including large files'
       Buffer.from(JSON.stringify(Array.from({ length: 5000 }, (_, id) => ({ id, city: 'Москва', active: true })))),
       Buffer.concat([randomBytes(2048), Buffer.alloc(262144)]),
       Buffer.from('abcabcabcabc!'),
+      Buffer.from('token Huffman compression has repeated phrases. '.repeat(500)),
+      Buffer.concat([Buffer.from('long-distance repeated data. '.repeat(4096)), randomBytes(80 * 1024), Buffer.from('long-distance repeated data. '.repeat(4096))]),
       randomBytes(1024 * 1024),
       Buffer.concat([Buffer.from('II*\0'), Buffer.alloc(8 * 1024 * 1024, 37)])
     ];

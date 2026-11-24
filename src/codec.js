@@ -12,6 +12,8 @@ const V3_HEADER_SIZE = 14;
 const LEGACY_HEADER_SIZE = 64;
 const COMPACT_ONE_BYTE_MARKER = 0xfe;
 const WINDOW_SIZE = 65536;
+const TOKEN_WINDOW_SIZE = 256 * 1024;
+const MAX_DISTANCE_SLOT = 18;
 const MAX_MATCH = 258;
 const CONTEXT_BLOCK_SIZE = 128 * 1024;
 
@@ -38,20 +40,22 @@ function hash3(data, i) {
 
 // LZSS stream: a flag byte followed by up to eight tokens. A literal is one
 // byte; a match is distance (uint16 LE, minus one) and length (uint8, minus 3).
-function lzssEncode(input, searchLimit = 48) {
+function lzssEncode(input, searchLimit = 48, windowSize = WINDOW_SIZE) {
+  if (windowSize < WINDOW_SIZE || (windowSize & (windowSize - 1)) !== 0) fail('invalid_archive', 'Некорректный размер окна LZSS');
+  const wideDistance = windowSize > WINDOW_SIZE;
   const n = input.length;
   const head = new Int32Array(65536);
   head.fill(-1);
-  const previous = new Int32Array(WINDOW_SIZE);
+  const previous = new Int32Array(windowSize);
   previous.fill(-1);
-  const result = new Uint8Array(n + Math.ceil(n / 8) + 16);
+  const result = new Uint8Array((wideDistance ? n * 2 : n) + Math.ceil(n / 8) + 16);
   let resultLength = 0;
   let position = 0;
 
   const insert = (at) => {
     if (at + 2 >= n) return;
     const h = hash3(input, at);
-    const slot = at & (WINDOW_SIZE - 1);
+    const slot = at & (windowSize - 1);
     previous[slot] = head[h];
     head[h] = at;
   };
@@ -67,7 +71,7 @@ function lzssEncode(input, searchLimit = 48) {
         let candidate = head[h];
         let examined = 0;
         const limit = Math.min(MAX_MATCH, n - position);
-        while (candidate >= 0 && position - candidate <= WINDOW_SIZE && examined < searchLimit) {
+        while (candidate >= 0 && position - candidate <= windowSize && examined < searchLimit) {
           const max = Math.min(limit, n - candidate);
           let length = 0;
           while (length < max && input[candidate + length] === input[position + length]) length++;
@@ -76,7 +80,7 @@ function lzssEncode(input, searchLimit = 48) {
             bestDistance = position - candidate;
             if (length === limit) break;
           }
-          const older = previous[candidate & (WINDOW_SIZE - 1)];
+          const older = previous[candidate & (windowSize - 1)];
           // A ring slot may already belong to a newer position. Stop rather
           // than following a stale forward link or cycling the chain.
           if (older >= candidate) break;
@@ -85,10 +89,15 @@ function lzssEncode(input, searchLimit = 48) {
         }
       }
 
-      if (bestLength >= 3) {
+      const minimumMatch = wideDistance ? writeVarUint(bestDistance).length + 2 : 3;
+      if (bestLength >= minimumMatch) {
         const encodedDistance = bestDistance - 1;
-        result[resultLength++] = encodedDistance & 0xff;
-        result[resultLength++] = encodedDistance >>> 8;
+        if (wideDistance) {
+          for (const byte of writeVarUint(bestDistance)) result[resultLength++] = byte;
+        } else {
+          result[resultLength++] = encodedDistance & 0xff;
+          result[resultLength++] = encodedDistance >>> 8;
+        }
         result[resultLength++] = bestLength - 3;
         for (let j = 0; j < bestLength; j++) insert(position + j);
         position += bestLength;
@@ -365,6 +374,282 @@ function wordDelta(input, stride, order, inverse = false) {
       previous = inverse ? encoded : value;
     }
   }
+  return output;
+}
+
+function huffmanCodesFromFrequencies(frequencies) {
+  const nodes = [];
+  const queue = [];
+  for (let symbol = 0; symbol < frequencies.length; symbol++) {
+    if (frequencies[symbol]) {
+      queue.push(nodes.length);
+      nodes.push({ frequency: frequencies[symbol], symbol, left: -1, right: -1 });
+    }
+  }
+  if (!queue.length) return null;
+  while (queue.length > 1) {
+    queue.sort((a, b) => nodes[a].frequency - nodes[b].frequency || a - b);
+    const left = queue.shift();
+    const right = queue.shift();
+    queue.push(nodes.length);
+    nodes.push({ frequency: nodes[left].frequency + nodes[right].frequency, symbol: -1, left, right });
+  }
+
+  const lengths = new Uint8Array(frequencies.length);
+  const walk = (index, depth) => {
+    const node = nodes[index];
+    if (node.symbol >= 0) {
+      lengths[node.symbol] = depth || 1;
+      return;
+    }
+    walk(node.left, depth + 1);
+    walk(node.right, depth + 1);
+  };
+  walk(queue[0], 0);
+
+  const counts = new Uint32Array(32);
+  let maxLength = 0;
+  for (const length of lengths) {
+    if (length > 31) return null;
+    if (length) {
+      counts[length]++;
+      maxLength = Math.max(maxLength, length);
+    }
+  }
+  const codes = new Uint32Array(frequencies.length);
+  const nextCode = new Uint32Array(32);
+  let code = 0;
+  for (let length = 1; length <= maxLength; length++) {
+    code = (code + counts[length - 1]) * 2;
+    if (code + counts[length] > 2 ** length) return null;
+    nextCode[length] = code;
+  }
+  for (let symbol = 0; symbol < lengths.length; symbol++) {
+    const length = lengths[symbol];
+    if (length) codes[symbol] = nextCode[length]++;
+  }
+  return { lengths, codes, maxLength };
+}
+
+function walkLzssTokens(input, stream, visit, wideDistance = false) {
+  let streamPosition = 0;
+  let outputPosition = 0;
+  while (outputPosition < input.length) {
+    if (streamPosition >= stream.length) return false;
+    const flags = stream[streamPosition++];
+    for (let bit = 0; bit < 8 && outputPosition < input.length; bit++) {
+      if (flags & (1 << bit)) {
+        if (streamPosition >= stream.length) return false;
+        visit(input[outputPosition], 0, 0);
+        streamPosition++;
+        outputPosition++;
+      } else {
+        let distance;
+        let length;
+        if (wideDistance) {
+          const state = { position: streamPosition };
+          try {
+            distance = readVarUint(stream, state);
+          } catch {
+            return false;
+          }
+          streamPosition = state.position;
+          if (streamPosition >= stream.length) return false;
+          length = stream[streamPosition++] + 3;
+        } else {
+          if (streamPosition + 3 > stream.length) return false;
+          distance = (stream[streamPosition] | (stream[streamPosition + 1] << 8)) + 1;
+          length = stream[streamPosition + 2] + 3;
+          streamPosition += 3;
+        }
+        if (distance > outputPosition || outputPosition + length > input.length) return false;
+        visit(256 + length - 3, distance, length);
+        outputPosition += length;
+      }
+    }
+  }
+  return streamPosition === stream.length;
+}
+
+// A DEFLATE-like token stream written from scratch: literals and match lengths
+// have separate canonical Huffman codes, while distances use logarithmic
+// slots plus low-order extra bits. The legacy LZSS format remains supported.
+function lzTokenHuffmanEncode(input, lzStream, wideDistance = false) {
+  const tokenFrequencies = new Uint32Array(512);
+  const distanceFrequencies = new Uint32Array(MAX_DISTANCE_SLOT + 1);
+  let extraBits = 0;
+  let tokenCount = 0;
+  const countToken = (symbol, distance, length) => {
+    tokenFrequencies[symbol]++;
+    tokenCount++;
+    if (distance) {
+      const slot = 31 - Math.clz32(distance);
+      distanceFrequencies[slot]++;
+      extraBits += slot;
+    }
+  };
+  if (!walkLzssTokens(input, lzStream, countToken, wideDistance) || !tokenCount) return null;
+  const tokenCodes = huffmanCodesFromFrequencies(tokenFrequencies);
+  const distanceCodes = huffmanCodesFromFrequencies(distanceFrequencies);
+  if (!tokenCodes || (distanceFrequencies.some(Boolean) && !distanceCodes)) return null;
+
+  let totalBits = extraBits;
+  for (let symbol = 0; symbol < tokenFrequencies.length; symbol++) {
+    totalBits += tokenFrequencies[symbol] * tokenCodes.lengths[symbol];
+  }
+  for (let symbol = 0; symbol < distanceFrequencies.length; symbol++) {
+    if (distanceFrequencies[symbol]) totalBits += distanceFrequencies[symbol] * distanceCodes.lengths[symbol];
+  }
+  const paramsBytes = 3 + tokenFrequencies.reduce((count, frequency) => count + (frequency ? 3 : 0), 0)
+    + distanceFrequencies.reduce((count, frequency) => count + (frequency ? 2 : 0), 0);
+  const estimatedPayloadSize = writeVarUint(paramsBytes).length + paramsBytes + Math.ceil(totalBits / 8);
+  const estimatedArchiveSize = 1 + writeVarUint(input.length).length + 4
+    + writeVarUint(estimatedPayloadSize).length + estimatedPayloadSize;
+  if (estimatedArchiveSize >= input.length + 5) return null;
+  const bitstream = Buffer.alloc(Math.ceil(totalBits / 8));
+  let bitPosition = 0;
+  const writeBits = (value, count) => {
+    while (count) {
+      const offset = bitPosition & 7;
+      const take = Math.min(8 - offset, count);
+      const shift = count - take;
+      const part = Math.floor(value / (2 ** shift)) % (2 ** take);
+      bitstream[bitPosition >>> 3] |= part << (8 - offset - take);
+      bitPosition += take;
+      count -= take;
+    }
+  };
+  const writeSymbol = (symbol, table) => writeBits(table.codes[symbol], table.lengths[symbol]);
+  const encodeToken = (symbol, distance) => {
+    writeSymbol(symbol, tokenCodes);
+    if (distance) {
+      const slot = 31 - Math.clz32(distance);
+      writeSymbol(slot, distanceCodes);
+      if (slot) writeBits(distance - 2 ** slot, slot);
+    }
+  };
+  if (!walkLzssTokens(input, lzStream, encodeToken, wideDistance) || bitPosition !== totalBits) return null;
+
+  const tokenCountUsed = tokenFrequencies.reduce((count, frequency) => count + (frequency ? 1 : 0), 0);
+  const distanceCountUsed = distanceFrequencies.reduce((count, frequency) => count + (frequency ? 1 : 0), 0);
+  const params = Buffer.alloc(3 + tokenCountUsed * 3 + distanceCountUsed * 2);
+  params.writeUInt16LE(tokenCountUsed, 0);
+  let position = 2;
+  for (let symbol = 0; symbol < tokenFrequencies.length; symbol++) {
+    if (!tokenFrequencies[symbol]) continue;
+    params.writeUInt16LE(symbol, position);
+    params[position + 2] = tokenCodes.lengths[symbol];
+    position += 3;
+  }
+  params[position++] = distanceCountUsed;
+  for (let symbol = 0; symbol < distanceFrequencies.length; symbol++) {
+    if (!distanceFrequencies[symbol]) continue;
+    params[position++] = symbol;
+    params[position++] = distanceCodes.lengths[symbol];
+  }
+  return { params, payload: bitstream };
+}
+
+function readLzTokenHuffmanParams(params) {
+  if (params.length < 3) fail('invalid_archive', 'Обрезаны параметры токенного LZ');
+  const tokenCount = params.readUInt16LE(0);
+  if (!tokenCount || tokenCount > 512 || params.length < 3 + tokenCount * 3) fail('invalid_archive', 'Некорректная таблица токенов LZ');
+  const tokenLengths = new Uint8Array(512);
+  const tokenFrequencies = new Uint32Array(512);
+  let position = 2;
+  for (let i = 0; i < tokenCount; i++) {
+    const symbol = params.readUInt16LE(position);
+    const length = params[position + 2];
+    if (symbol >= tokenLengths.length || !length || length > 31 || tokenLengths[symbol]) fail('invalid_archive', 'Некорректный код токена LZ');
+    tokenLengths[symbol] = length;
+    tokenFrequencies[symbol] = 1;
+    position += 3;
+  }
+  const distanceCount = params[position++];
+  if (distanceCount > MAX_DISTANCE_SLOT + 1 || params.length !== position + distanceCount * 2) fail('invalid_archive', 'Некорректная таблица расстояний LZ');
+  const distanceLengths = new Uint8Array(MAX_DISTANCE_SLOT + 1);
+  const distanceFrequencies = new Uint32Array(MAX_DISTANCE_SLOT + 1);
+  for (let i = 0; i < distanceCount; i++) {
+    const symbol = params[position++];
+    const length = params[position++];
+    if (symbol > MAX_DISTANCE_SLOT || !length || length > 31 || distanceLengths[symbol]) fail('invalid_archive', 'Некорректный код расстояния LZ');
+    distanceLengths[symbol] = length;
+    distanceFrequencies[symbol] = 1;
+  }
+  if (!distanceCount) fail('invalid_archive', 'Нет таблицы расстояний для LZ');
+  const tokenTable = canonicalDecodeTable(tokenLengths);
+  const distanceTable = distanceCount ? canonicalDecodeTable(distanceLengths) : null;
+  return { tokenTable, distanceTable };
+}
+
+function canonicalDecodeTable(lengths) {
+  const counts = new Uint32Array(32);
+  let maxLength = 0;
+  for (const length of lengths) {
+    if (length) {
+      counts[length]++;
+      maxLength = Math.max(maxLength, length);
+    }
+  }
+  if (!maxLength) fail('invalid_archive', 'Пустая таблица токенного LZ');
+  const byLength = Array.from({ length: maxLength + 1 }, () => new Map());
+  const nextCode = new Uint32Array(32);
+  let code = 0;
+  for (let length = 1; length <= maxLength; length++) {
+    code = (code + counts[length - 1]) * 2;
+    if (code + counts[length] > 2 ** length) fail('invalid_archive', 'Повреждена таблица токенного LZ');
+    nextCode[length] = code;
+  }
+  for (let symbol = 0; symbol < lengths.length; symbol++) {
+    const length = lengths[symbol];
+    if (length) byLength[length].set(nextCode[length]++, symbol);
+  }
+  return { byLength, maxLength };
+}
+
+function lzTokenHuffmanDecode(payload, params, outputSize, maxDistance = WINDOW_SIZE) {
+  const { tokenTable, distanceTable } = readLzTokenHuffmanParams(params);
+  let bitPosition = 0;
+  const totalBits = payload.length * 8;
+  const readBits = count => {
+    if (bitPosition + count > totalBits) fail('invalid_archive', 'Обрезан токенный поток LZ');
+    let value = 0;
+    for (let i = 0; i < count; i++) {
+      value = value * 2 + ((payload[bitPosition >>> 3] >>> (7 - (bitPosition & 7))) & 1);
+      bitPosition++;
+    }
+    return value;
+  };
+  const readSymbol = table => {
+    if (!table) fail('invalid_archive', 'Отсутствует таблица расстояний LZ');
+    let code = 0;
+    for (let length = 1; length <= table.maxLength; length++) {
+      code = code * 2 + readBits(1);
+      const symbol = table.byLength[length].get(code);
+      if (symbol !== undefined) return symbol;
+    }
+    fail('invalid_archive', 'Некорректный код токенного LZ');
+  };
+
+  const output = Buffer.alloc(outputSize);
+  let written = 0;
+  while (written < outputSize) {
+    const symbol = readSymbol(tokenTable);
+    if (symbol < 256) {
+      output[written++] = symbol;
+      continue;
+    }
+    const length = symbol - 256 + 3;
+    const slot = readSymbol(distanceTable);
+    const distance = 2 ** slot + (slot ? readBits(slot) : 0);
+    if (length > MAX_MATCH || distance > written || distance > maxDistance || written + length > outputSize) fail('invalid_archive', 'Некорректная ссылка токенного LZ');
+    for (let i = 0; i < length; i++) {
+      output[written] = output[written - distance];
+      written++;
+    }
+  }
+  const padding = totalBits - bitPosition;
+  if (padding > 7 || (padding && readBits(padding) !== 0)) fail('invalid_archive', 'Некорректное заполнение токенного LZ');
   return output;
 }
 
@@ -1202,6 +1487,16 @@ export function compress(inputData) {
     const total = encodedSize(method, params, payload);
     if (total < best.total) best = { method, params, payload, total };
   };
+  const considerTokenLz = (lzStream, wideDistance) => {
+    const tokenHuffman = lzTokenHuffmanEncode(input, lzStream, wideDistance);
+    if (!tokenHuffman) return;
+    const payload = Buffer.concat([
+      Buffer.from([wideDistance ? 1 : 0]), Buffer.from(writeVarUint(tokenHuffman.params.length)),
+      tokenHuffman.params, tokenHuffman.payload
+    ]);
+    const total = encodedSize(8, Buffer.alloc(0), payload);
+    if (total < best.total) best = { method: 8, params: Buffer.alloc(0), payload, total };
+  };
 
   const period = repeatedPeriod(input);
   if (period) {
@@ -1219,8 +1514,16 @@ export function compress(inputData) {
   }
 
   const wordTransformId = chooseWordTransform(input);
-  if (!wordTransformId && looksIncompressible(input)) {
-    return createArchive(0, input, Buffer.alloc(0), input, checksum);
+  const incompressible = !wordTransformId && looksIncompressible(input);
+  if (incompressible) {
+    // Entropy probes can miss a repeated region when the duplicated pages are
+    // farther apart than the regular LZ window. Make one bounded wide-window
+    // pass before falling back to store; do not run BWT or numeric transforms.
+    if (input.length > WINDOW_SIZE && input.length <= 2 * 1024 * 1024 && best.method === 0) {
+      const lz = lzssEncode(input, 12, TOKEN_WINDOW_SIZE);
+      considerTokenLz(lz, true);
+    }
+    return createArchive(best.method, input, best.params, best.payload, checksum);
   }
 
   const rle = rleEncode(input);
@@ -1240,10 +1543,19 @@ export function compress(inputData) {
   const searchLimits = textLike && input.length < 1024 * 1024
     ? [searchLimit, 96]
     : [searchLimit];
+  const tokenCandidateAllowed = input.length <= 16 * 1024 * 1024 && (!incompressible || input.length > WINDOW_SIZE);
   for (const limit of new Set(searchLimits)) {
     const lz = lzssEncode(input, limit);
     const rawLzTotal = encodedSize(9, Buffer.alloc(0), lz);
     if (rawLzTotal < best.total) best = { method: 9, params: Buffer.alloc(0), payload: lz, total: rawLzTotal };
+    if (tokenCandidateAllowed) {
+      const tokenOptions = input.length > 128 * 1024 && input.length <= 2 * 1024 * 1024
+        ? [{ lz, wideDistance: false }, { lz: lzssEncode(input, limit, TOKEN_WINDOW_SIZE), wideDistance: true }]
+        : [{ lz, wideDistance: false }];
+      for (const option of tokenOptions) {
+        considerTokenLz(option.lz, option.wideDistance);
+      }
+    }
     const lzHuffman = buildHuffman(lz);
     if (lzHuffman) {
       const params = huffmanParams(lzHuffman);
@@ -1383,7 +1695,7 @@ function readHeader(archive) {
 function readV3Header(archive) {
   if (archive.length < 5) fail('invalid_archive', 'Обрезан компактный заголовок');
   const method = archive[0] - 0xf0;
-  if (![0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15].includes(method)) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
+  if (![0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15].includes(method)) fail('unsupported_method', `Неподдерживаемый метод: ${method}`);
   if (method === 0) {
     const originalSize = archive.length - 5;
     return { legacy: false, v2: false, compact: true, method, originalSize, params: Buffer.alloc(0), payload: archive.subarray(5), checksum: archive.subarray(1, 5) };
@@ -1511,6 +1823,15 @@ export function decompress(archiveData) {
     if (!period || header.payload.length !== period) fail('invalid_archive', 'Некорректный повторяющийся блок');
     output = Buffer.alloc(header.originalSize);
     for (let position = 0; position < output.length; position++) output[position] = header.payload[position % period];
+  } else if (header.method === 8) {
+    if (header.payload.length < 2 || header.payload[0] > 1) fail('invalid_archive', 'Некорректный режим окна токенного LZ');
+    const maxDistance = header.payload[0] ? TOKEN_WINDOW_SIZE : WINDOW_SIZE;
+    const state = { position: 1 };
+    const paramsLength = readVarUint(header.payload, state);
+    if (!paramsLength || paramsLength > header.payload.length - state.position) fail('invalid_archive', 'Некорректный размер таблиц токенного LZ');
+    const params = header.payload.subarray(state.position, state.position + paramsLength);
+    state.position += paramsLength;
+    output = lzTokenHuffmanDecode(header.payload.subarray(state.position), params, header.originalSize, maxDistance);
   } else if (header.method === 9) {
     output = lzssDecode(header.payload, header.originalSize);
   } else if (header.method === 10) {
@@ -1553,7 +1874,7 @@ export const formatInfo = {
   version: VERSION,
   headerSize: 5,
   storeHeaderSize: 5,
-  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman', 12: 'small-lz', 13: 'bwt+mtf+huffman', 14: 'word-dictionary', 15: 'word-delta+bwt' }
+  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 8: 'lz-token+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman', 12: 'small-lz', 13: 'bwt+mtf+huffman', 14: 'word-dictionary', 15: 'word-delta+bwt' }
 };
 
-export const _testInternals = { lzssEncode, lzssDecode, smallLzEncode, smallLzDecode, wordDictionaryEncode, bwtEncode, bwtDecode, mtfRunsEncode, mtfRunsDecode, contextBlocksEncode, contextBlocksDecode, numericTransform, buildHuffman, decodeHuffman };
+export const _testInternals = { lzssEncode, lzssDecode, smallLzEncode, smallLzDecode, wordDictionaryEncode, bwtEncode, bwtDecode, mtfRunsEncode, mtfRunsDecode, contextBlocksEncode, contextBlocksDecode, numericTransform, buildHuffman, decodeHuffman, lzTokenHuffmanEncode, lzTokenHuffmanDecode };

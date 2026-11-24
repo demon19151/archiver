@@ -91,6 +91,48 @@ test('numeric filters are bit-exact with wraparound, odd sizes and short tails',
   }
 });
 
+test('Huffman-coded LZ tokens round-trip literals, distances and long matches', () => {
+  const inputs = [
+    Buffer.from('token Huffman compression has repeated phrases. '.repeat(500)),
+    Buffer.concat([randomBytes(12000, 35), Buffer.from('shared binary section'.repeat(900)), randomBytes(9000, 89)]),
+    Buffer.from(Array.from({ length: 50000 }, (_, index) => (index * 17 + (index >>> 5)) & 255))
+  ];
+  for (const input of inputs) {
+    const lz = internals.lzssEncode(input, 64);
+    const encoded = internals.lzTokenHuffmanEncode(input, lz);
+    assert.ok(encoded);
+    assert.deepEqual(internals.lzTokenHuffmanDecode(encoded.payload, encoded.params, input.length), input);
+    const archive = compress(input);
+    assert.deepEqual(decompress(archive), input);
+  }
+  const input = Buffer.from('malformed token stream '.repeat(200));
+  const encoded = internals.lzTokenHuffmanEncode(input, internals.lzssEncode(input, 32));
+  assert.throws(() => internals.lzTokenHuffmanDecode(Buffer.alloc(0), encoded.params, input.length), ArchiveError);
+});
+
+test('extended-window LZ token stream round-trips references beyond 64 KiB', () => {
+  const prefix = Buffer.from('long-distance repeated data. '.repeat(4096));
+  const spacer = randomBytes(80 * 1024, 7821);
+  const input = Buffer.concat([prefix, spacer, prefix]);
+  const lz = internals.lzssEncode(input, 64, 256 * 1024);
+  const encoded = internals.lzTokenHuffmanEncode(input, lz, true);
+  assert.ok(encoded);
+  assert.deepEqual(internals.lzTokenHuffmanDecode(encoded.payload, encoded.params, input.length, 256 * 1024), input);
+  assert.throws(() => internals.lzTokenHuffmanDecode(encoded.payload, encoded.params, input.length, 64 * 1024), ArchiveError);
+  const boundaryInput = Buffer.concat([prefix, Buffer.from('tiny unique insert'), prefix]);
+  const archive = compress(boundaryInput);
+  assert.deepEqual(decompress(archive), boundaryInput);
+});
+
+test('high-entropy inputs with repeated distant regions can still use long matches', () => {
+  const prefix = randomBytes(24 * 1024, 2361);
+  const spacer = randomBytes(96 * 1024, 7822);
+  const input = Buffer.concat([prefix, spacer, prefix]);
+  const archive = compress(input);
+  assert.deepEqual(decompress(archive), input);
+  assert.ok(archive.length < input.length, 'distant repeated data should compress even when entropy probes are noisy');
+});
+
 test('16-bit numeric signal uses filtered compression and rejects invalid filters', () => {
   const input = compressionFixtures().find(([name]) => name === 'pcm16-signal')[1];
   const archive = compress(input);
