@@ -177,6 +177,33 @@ test('record-period delta discovers 20-byte binary records and restores exact by
   assert.deepEqual(decompress(archive), input);
 });
 
+test('record-column transpose preserves arbitrary phases, strides and incomplete tails', () => {
+  for (const stride of [4, 8, 20, 37, 64, 128]) {
+    for (const phase of [0, Math.min(stride - 1, 3), Math.floor(stride / 2)]) {
+      for (const size of [0, 1, stride - 1, stride, stride + 1, 8197]) {
+        const input = randomBytes(size, stride * 1009 + phase * 17 + size);
+        const transposed = internals.transposeBytes(input, stride, phase);
+        assert.deepEqual(internals.untransposeBytes(transposed, stride, phase), input, `stride ${stride}, phase ${phase}, size ${size}`);
+      }
+    }
+  }
+  const input = compressionFixtures().find(([name]) => name === 'binary-records')[1];
+  const stride = internals.chooseRecordStride(input);
+  for (const phase of internals.chooseTransposeParameters(input, stride)) {
+    const transposed = internals.transposeBytes(input, stride, phase);
+    const payload = Buffer.concat([varUint(0), varUint(stride), varUint(phase), internals.contextBlocksEncode(transposed, 20 * 1024)]);
+    const archive = record(7, input, payload);
+    assert.deepEqual(decompress(archive), input);
+  }
+  const archive = compress(input);
+  assert.deepEqual(decompress(archive), input);
+  assert.ok(archive.length < input.length * 0.3);
+  const badStride = record(7, input, Buffer.concat([varUint(0), varUint(1), varUint(0), internals.contextBlocksEncode(input, 128 * 1024)]));
+  const badPhase = record(7, input, Buffer.concat([varUint(0), varUint(stride), varUint(stride), internals.contextBlocksEncode(input, 128 * 1024)]));
+  assert.throws(() => decompress(badStride), ArchiveError);
+  assert.throws(() => decompress(badPhase), ArchiveError);
+});
+
 test('PNG-like high-entropy data stays byte-exact and is not replaced with lossy output', () => {
   const input = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), randomBytes(64 * 1024, 7712)]);
   const archive = compress(input);

@@ -16,6 +16,7 @@ const TOKEN_WINDOW_SIZE = 256 * 1024;
 const MAX_DISTANCE_SLOT = 18;
 const MAX_MATCH = 258;
 const CONTEXT_BLOCK_SIZE = 128 * 1024;
+const RECORD_TRANSPOSE_MARKER = 0;
 const RECORD_STRIDES = [...new Set([
   ...Array.from({ length: 63 }, (_, index) => 4 + index * 4),
   ...Array.from({ length: 16 }, (_, index) => 256 + (index + 1) * 16),
@@ -1303,7 +1304,7 @@ function contextBlocksEncode(input, blockSize = CONTEXT_BLOCK_SIZE) {
 function contextBlocksDecode(payload, outputSize) {
   const state = { position: 0 };
   const blockSize = readVarUint(payload, state);
-  if (![32, 64, 128, 256, 512].some(size => size * 1024 === blockSize)) fail('invalid_archive', 'Недопустимый размер блока BWT');
+  if (![16, 20, 24, 28, 32, 40, 64, 128, 256, 512].some(size => size * 1024 === blockSize)) fail('invalid_archive', 'Недопустимый размер блока BWT');
   const count = readVarUint(payload, state);
   if (count !== Math.ceil(outputSize / blockSize) || !count) fail('invalid_archive', 'Некорректное число блоков BWT');
   const output = Buffer.allocUnsafe(outputSize);
@@ -1344,6 +1345,56 @@ function contextBlocksDecode(payload, outputSize) {
     written += length;
   }
   if (state.position !== payload.length) fail('invalid_archive', 'Лишние данные блоков BWT');
+  return output;
+}
+
+function transposeBytes(input, stride, phase = 0) {
+  if (!Number.isInteger(stride) || stride < 1 || stride > 4096 || !Number.isInteger(phase) || phase < 0 || phase >= stride) fail('invalid_archive', 'Некорректные параметры транспонирования');
+  const prefix = Math.min(phase, input.length);
+  const tail = (input.length - prefix) % stride;
+  const rows = Math.floor((input.length - prefix) / stride);
+  const output = Buffer.allocUnsafe(input.length);
+  input.copy(output, 0, 0, prefix);
+  let destination = prefix;
+  for (let column = 0; column < stride; column++) {
+    for (let row = 0; row < rows; row++) output[destination++] = input[prefix + row * stride + column];
+  }
+  input.copy(output, destination, input.length - tail);
+  return output;
+}
+
+function chooseTransposeParameters(input, stride) {
+  const sampleSize = Math.min(input.length, 8192);
+  const phases = [];
+  for (let phase = 0; phase < stride; phase++) {
+    const counts = Array.from({ length: stride }, () => new Uint32Array(256));
+    const totals = new Uint32Array(stride);
+    for (let index = phase; index < sampleSize; index++) {
+      const column = (index - phase) % stride;
+      counts[column][input[index]]++;
+      totals[column]++;
+    }
+    let sumEntropy = 0;
+    for (let column = 0; column < stride; column++) sumEntropy += entropyFromCounts(counts[column], totals[column]);
+    phases.push({ phase, score: sumEntropy / stride });
+  }
+  phases.sort((a, b) => a.score - b.score || a.phase - b.phase);
+  return phases.slice(0, Math.min(1, phases.length)).map(({ phase }) => phase);
+}
+
+function untransposeBytes(input, stride, phase = 0) {
+  if (!Number.isInteger(stride) || stride < 1 || stride > 4096 || !Number.isInteger(phase) || phase < 0 || phase >= stride) fail('invalid_archive', 'Некорректные параметры транспонирования');
+  const prefix = Math.min(phase, input.length);
+  const tail = (input.length - prefix) % stride;
+  const rows = Math.floor((input.length - prefix) / stride);
+  const output = Buffer.allocUnsafe(input.length);
+  input.copy(output, 0, 0, prefix);
+  let source = prefix;
+  for (let column = 0; column < stride; column++) {
+    for (let row = 0; row < rows; row++) output[prefix + row * stride + column] = input[source++];
+  }
+  input.copy(output, input.length - tail, source, source + tail);
+  if (source + tail !== input.length) fail('invalid_archive', 'Некорректный транспонированный поток записей');
   return output;
 }
 
@@ -1440,10 +1491,14 @@ function repeatedPeriod(input) {
 function entropy(data) {
   const counts = new Uint32Array(256);
   for (const byte of data) counts[byte]++;
+  return entropyFromCounts(counts, data.length);
+}
+
+function entropyFromCounts(counts, total) {
   let result = 0;
   for (const count of counts) {
     if (count) {
-      const probability = count / data.length;
+      const probability = count / total;
       result -= probability * Math.log2(probability);
     }
   }
@@ -1657,6 +1712,30 @@ export function compress(inputData) {
     const total = encodedSize(7, Buffer.alloc(0), payload);
     if (total < best.total) {
       best = { method: 7, params: Buffer.alloc(0), payload, total };
+    }
+
+    // A byte transpose groups similar record columns before BWT. The detector
+    // chooses a phase from the sample, then the full archive still competes
+    // against every existing method by total size.
+    const transposeStride = stride >= 8 && stride <= 64 ? stride : 0;
+    if (transposeStride) {
+      const phases = chooseTransposeParameters(input, transposeStride);
+      const transposeCandidates = [];
+      for (const phase of phases) {
+        const transposed = transposeBytes(input, transposeStride, phase);
+        for (const blockSize of [16, 20, 24, 28, 32, 40]) {
+          const payload = Buffer.concat([
+            Buffer.from(writeVarUint(RECORD_TRANSPOSE_MARKER)),
+            Buffer.from(writeVarUint(transposeStride)),
+            Buffer.from(writeVarUint(phase)),
+            contextBlocksEncode(transposed, blockSize * 1024)
+          ]);
+          const total = encodedSize(7, Buffer.alloc(0), payload);
+          transposeCandidates.push({ method: 7, params: Buffer.alloc(0), payload, total });
+        }
+      }
+      transposeCandidates.sort((a, b) => a.total - b.total);
+      if (transposeCandidates[0]?.total < best.total) best = transposeCandidates[0];
     }
   }
   if (input.length <= 4096) {
@@ -1897,8 +1976,15 @@ export function decompress(archiveData) {
   } else if (header.method === 7) {
     const state = { position: 0 };
     const stride = readVarUint(header.payload, state);
-    if (!RECORD_STRIDES.includes(stride)) fail('invalid_archive', 'Некорректный шаг бинарных записей');
-    output = restoreDeltaStride(contextBlocksDecode(header.payload.subarray(state.position), header.originalSize), stride);
+    if (stride === RECORD_TRANSPOSE_MARKER) {
+      const transposeStride = readVarUint(header.payload, state);
+      const phase = readVarUint(header.payload, state);
+      if (transposeStride < 2 || transposeStride > 4096 || phase >= transposeStride) fail('invalid_archive', 'Некорректные параметры транспонирования записей');
+      output = untransposeBytes(contextBlocksDecode(header.payload.subarray(state.position), header.originalSize), transposeStride, phase);
+    } else {
+      if (!RECORD_STRIDES.includes(stride)) fail('invalid_archive', 'Некорректный шаг бинарных записей');
+      output = restoreDeltaStride(contextBlocksDecode(header.payload.subarray(state.position), header.originalSize), stride);
+    }
   } else if (header.method === 9) {
     output = lzssDecode(header.payload, header.originalSize);
   } else if (header.method === 10) {
@@ -1941,7 +2027,7 @@ export const formatInfo = {
   version: VERSION,
   headerSize: 5,
   storeHeaderSize: 5,
-  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 7: 'record-delta+bwt', 8: 'lz-token+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman', 12: 'small-lz', 13: 'bwt+mtf+huffman', 14: 'word-dictionary', 15: 'word-delta+bwt' }
+  methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 7: 'record-context+bwt', 8: 'lz-token+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman', 12: 'small-lz', 13: 'bwt+mtf+huffman', 14: 'word-dictionary', 15: 'word-delta+bwt' }
 };
 
-export const _testInternals = { lzssEncode, lzssDecode, smallLzEncode, smallLzDecode, wordDictionaryEncode, bwtEncode, bwtDecode, mtfRunsEncode, mtfRunsDecode, contextBlocksEncode, contextBlocksDecode, numericTransform, buildHuffman, decodeHuffman, lzTokenHuffmanEncode, lzTokenHuffmanDecode, chooseRecordStride };
+export const _testInternals = { lzssEncode, lzssDecode, smallLzEncode, smallLzDecode, wordDictionaryEncode, bwtEncode, bwtDecode, mtfRunsEncode, mtfRunsDecode, contextBlocksEncode, contextBlocksDecode, numericTransform, transposeBytes, untransposeBytes, chooseTransposeParameters, buildHuffman, decodeHuffman, lzTokenHuffmanEncode, lzTokenHuffmanDecode, chooseRecordStride };
