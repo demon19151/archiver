@@ -42,7 +42,7 @@ test('browser worker produces server-compatible archives, including large files'
     // Exercise new block methods and multi-block decoding in the bundled code,
     // not only the Node implementation.
     for (const [name, input] of compressionFixtures()) {
-      if (['csv-varied', 'pcm16-signal'].includes(name)) cases.push(input);
+      if (['english-varied-240k', 'russian-numbered', 'csv-varied', 'json-varied', 'pcm16-signal'].includes(name)) cases.push(input);
     }
     for (const input of cases) {
       const browserArchive = callWorker('compress', input);
