@@ -1274,7 +1274,146 @@ function mtfRunsDecode(input, outputSize) {
   return output;
 }
 
-function contextBlocksEncode(input, blockSize = CONTEXT_BLOCK_SIZE) {
+// Bijective binary zero-run digits (0/1); nonzero MTF ranks are shifted by 1.
+// Unlike byte-varint runs this keeps the run alphabet separate from literals.
+function mtfBinaryEncode(input) {
+  const alphabet = Uint8Array.from({ length: 256 }, (_, i) => i);
+  const symbols = [];
+  let zeros = 0;
+  const flush = () => {
+    while (zeros) {
+      zeros--;
+      symbols.push(zeros & 1);
+      zeros = Math.floor(zeros / 2);
+    }
+  };
+  for (const byte of input) {
+    let rank = 0;
+    while (alphabet[rank] !== byte) rank++;
+    if (!rank) { zeros++; continue; }
+    flush();
+    symbols.push(rank + 1);
+    for (let i = rank; i > 0; i--) alphabet[i] = alphabet[i - 1];
+    alphabet[0] = byte;
+  }
+  flush();
+  return Uint16Array.from(symbols);
+}
+
+function mtfBinaryDecode(symbols, outputSize) {
+  const alphabet = Uint8Array.from({ length: 256 }, (_, i) => i);
+  const output = Buffer.allocUnsafe(outputSize);
+  let written = 0, zeros = 0, weight = 1;
+  const flush = () => {
+    if (zeros) output.fill(alphabet[0], written, written + zeros);
+    written += zeros;
+    zeros = 0; weight = 1;
+  };
+  for (const symbol of symbols) {
+    if (symbol < 2) {
+      zeros += (symbol + 1) * weight;
+      if (zeros > outputSize - written) fail('invalid_archive', 'Слишком длинная бинарная серия MTF');
+      weight *= 2;
+    } else {
+      flush();
+      if (symbol > 256 || written >= outputSize) fail('invalid_archive', 'Некорректный бинарный ранг MTF');
+      const rank = symbol - 1;
+      const byte = alphabet[rank];
+      output[written++] = byte;
+      for (let i = rank; i > 0; i--) alphabet[i] = alphabet[i - 1];
+      alphabet[0] = byte;
+    }
+  }
+  flush();
+  if (written !== outputSize) fail('invalid_archive', 'Обрезан бинарный поток MTF');
+  return output;
+}
+
+function arithmeticContext(symbol, contextual) {
+  return contextual ? Math.min(9, symbol < 2 ? symbol : 2 + Math.floor(Math.log2(symbol))) : 0;
+}
+
+// Integer 32-bit arithmetic intervals, 12-bit adaptive binary probabilities.
+// Products stay below 2^44 and are exact JavaScript integers. No platform codec.
+function arithmeticEncode(symbols, width, contextual) {
+  const probabilities = new Uint16Array(10 * 1024);
+  probabilities.fill(2048);
+  const output = [];
+  let low = 0, high = 0xffffffff, pending = 0, context = 0;
+  let byte = 0, bits = 0;
+  const put = bit => {
+    byte = (byte << 1) | bit;
+    if (++bits === 8) { output.push(byte); byte = 0; bits = 0; }
+  };
+  const emit = bit => { put(bit); while (pending) { put(bit ^ 1); pending--; } };
+  for (const symbol of symbols) {
+    let node = 1;
+    for (let shift = width - 1; shift >= 0; shift--) {
+      const index = context * 1024 + node;
+      const probability = probabilities[index];
+      const bit = (symbol >>> shift) & 1;
+      const split = low + Math.floor((high - low + 1) * probability / 4096);
+      if (bit) low = split; else high = split - 1;
+      probabilities[index] = bit ? probability - (probability >>> 4) : probability + ((4096 - probability) >>> 4);
+      for (;;) {
+        if (high < 0x80000000) emit(0);
+        else if (low >= 0x80000000) { emit(1); low -= 0x80000000; high -= 0x80000000; }
+        else if (low >= 0x40000000 && high < 0xc0000000) { pending++; low -= 0x40000000; high -= 0x40000000; }
+        else break;
+        low *= 2; high = high * 2 + 1;
+      }
+      node = node * 2 + bit;
+    }
+    context = arithmeticContext(symbol, contextual);
+  }
+  pending++; emit(low < 0x40000000 ? 0 : 1);
+  if (bits) output.push(byte << (8 - bits));
+  // Explicit lookahead, never silently synthesize missing input bits.
+  output.push(0, 0, 0, 0);
+  return Buffer.from(output);
+}
+
+function arithmeticDecode(data, count, width, contextual) {
+  const probabilities = new Uint16Array(10 * 1024);
+  probabilities.fill(2048);
+  const output = new Uint16Array(count);
+  let low = 0, high = 0xffffffff, code = 0, position = 0, context = 0;
+  const get = () => {
+    if (position >= data.length * 8) fail('invalid_archive', 'Обрезан арифметический поток');
+    const bit = (data[position >>> 3] >>> (7 - (position & 7))) & 1;
+    position++;
+    return bit;
+  };
+  for (let i = 0; i < 32; i++) code = code * 2 + get();
+  for (let i = 0; i < count; i++) {
+    let node = 1, symbol = 0;
+    for (let shift = width - 1; shift >= 0; shift--) {
+      const index = context * 1024 + node;
+      const probability = probabilities[index];
+      const split = low + Math.floor((high - low + 1) * probability / 4096);
+      const bit = code >= split ? 1 : 0;
+      if (bit) low = split; else high = split - 1;
+      probabilities[index] = bit ? probability - (probability >>> 4) : probability + ((4096 - probability) >>> 4);
+      for (;;) {
+        if (high < 0x80000000) { /* lower half */ }
+        else if (low >= 0x80000000) { code -= 0x80000000; low -= 0x80000000; high -= 0x80000000; }
+        else if (low >= 0x40000000 && high < 0xc0000000) { code -= 0x40000000; low -= 0x40000000; high -= 0x40000000; }
+        else break;
+        low *= 2; high = high * 2 + 1; code = code * 2 + get();
+      }
+      node = node * 2 + bit;
+      symbol = symbol * 2 + bit;
+    }
+    if (symbol > 256) fail('invalid_archive', 'Некорректный арифметический символ');
+    output[i] = symbol;
+    context = arithmeticContext(symbol, contextual);
+  }
+  // Canonical termination also rejects trailing bytes and altered lookahead.
+  if (!arithmeticEncode(output, width, contextual).equals(data)) fail('invalid_archive', 'Некорректное завершение арифметического потока');
+  return output;
+}
+
+function contextBlocksEncode(input, blockSize = CONTEXT_BLOCK_SIZE, adaptive = false) {
   const count = Math.ceil(input.length / blockSize);
   const parts = [Buffer.from(writeVarUint(blockSize)), Buffer.from(writeVarUint(count))];
   for (let start = 0; start < input.length; start += blockSize) {
@@ -1295,6 +1434,19 @@ function contextBlocksEncode(input, blockSize = CONTEXT_BLOCK_SIZE) {
         Buffer.from(writeVarUint(huffman.data.length)), huffman.data
       ]);
       if (compressed.length < raw.length) chosen = compressed;
+    }
+    if (adaptive) {
+      const binary = mtfBinaryEncode(bwt.data);
+      for (const mode of [3, 4, 5]) {
+        const symbols = mode === 3 ? runs : binary;
+        const data = arithmeticEncode(symbols, mode === 3 ? 8 : 9, mode !== 5);
+        const compressed = Buffer.concat([
+          Buffer.from([mode]), Buffer.from(writeVarUint(block.length)),
+          Buffer.from(writeVarUint(bwt.primary)), Buffer.from(writeVarUint(symbols.length)),
+          Buffer.from(writeVarUint(data.length)), data
+        ]);
+        if (compressed.length < chosen.length) chosen = compressed;
+      }
     }
     parts.push(chosen);
   }
@@ -1339,6 +1491,16 @@ function contextBlocksDecode(payload, outputSize) {
       const runs = decodeHuffman(payload.subarray(state.position, state.position + dataLength), huffman.lengths, huffman.decodedSize);
       state.position += dataLength;
       bwtDecode(mtfRunsDecode(runs, length), primary).copy(output, written);
+    } else if (mode >= 3 && mode <= 5) {
+      const primary = readVarUint(payload, state);
+      const symbols = readVarUint(payload, state);
+      const dataLength = readVarUint(payload, state);
+      if (primary >= length || !symbols || symbols > length * 2 + 8 || dataLength < 5 || dataLength > payload.length - state.position) fail('invalid_archive', 'Некорректный арифметический блок BWT');
+      const data = payload.subarray(state.position, state.position + dataLength);
+      state.position += dataLength;
+      const ranks = arithmeticDecode(data, symbols, mode === 3 ? 8 : 9, mode !== 5);
+      const sorted = mode === 3 ? mtfRunsDecode(ranks, length) : mtfBinaryDecode(ranks, length);
+      bwtDecode(sorted, primary).copy(output, written);
     } else {
       fail('invalid_archive', 'Неизвестный режим блока BWT');
     }
@@ -1752,9 +1914,9 @@ export function compress(inputData) {
   }
   // A separate context-sorting candidate helps diverse prose and structured
   // binary that don't have long exact LZ matches. Keep all previous winners.
-  if (input.length >= 256 && input.length <= 2 * 1024 * 1024 && best.total > input.length * 0.03) {
+  if (input.length >= 64 && input.length <= 2 * 1024 * 1024) {
     for (const blockSize of [128, 512]) {
-      const contextPayload = contextBlocksEncode(input, blockSize * 1024);
+      const contextPayload = contextBlocksEncode(input, blockSize * 1024, true);
       const total = encodedSize(13, Buffer.alloc(0), contextPayload);
       if (total < best.total) best = { method: 13, params: Buffer.alloc(0), payload: contextPayload, total };
     }
@@ -2030,4 +2192,4 @@ export const formatInfo = {
   methods: { 0: 'store', 1: 'lzss+huffman', 2: 'huffman', 3: 'delta+lzss+huffman', 4: 'rle', 5: 'repeat', 6: 'transform+lzss+huffman', 7: 'record-context+bwt', 8: 'lz-token+huffman', 9: 'lzss', 10: 'mixed-rle', 11: 'compact-huffman', 12: 'small-lz', 13: 'bwt+mtf+huffman', 14: 'word-dictionary', 15: 'word-delta+bwt' }
 };
 
-export const _testInternals = { lzssEncode, lzssDecode, smallLzEncode, smallLzDecode, wordDictionaryEncode, bwtEncode, bwtDecode, mtfRunsEncode, mtfRunsDecode, contextBlocksEncode, contextBlocksDecode, numericTransform, transposeBytes, untransposeBytes, chooseTransposeParameters, buildHuffman, decodeHuffman, lzTokenHuffmanEncode, lzTokenHuffmanDecode, chooseRecordStride };
+export const _testInternals = { lzssEncode, lzssDecode, smallLzEncode, smallLzDecode, wordDictionaryEncode, bwtEncode, bwtDecode, mtfRunsEncode, mtfRunsDecode, mtfBinaryEncode, mtfBinaryDecode, arithmeticEncode, arithmeticDecode, contextBlocksEncode, contextBlocksDecode, numericTransform, transposeBytes, untransposeBytes, chooseTransposeParameters, buildHuffman, decodeHuffman, lzTokenHuffmanEncode, lzTokenHuffmanDecode, chooseRecordStride };

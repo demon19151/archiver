@@ -41,6 +41,85 @@ test('MTF run coding preserves all ranks and validates lengths', () => {
   }
 });
 
+test('binary MTF zero-run digits restore runs, all byte values and reject overruns', () => {
+  for (const size of [1, 2, 3, 4, 7, 8, 255, 256, 257, 65537]) {
+    for (const input of [Buffer.alloc(size), Buffer.alloc(size, 255), randomBytes(size)]) {
+      const symbols = internals.mtfBinaryEncode(input);
+      assert.deepEqual(internals.mtfBinaryDecode(symbols, size), input);
+    }
+  }
+  for (const symbols of [[0, 0, 0], [257], [2, 2, 2, 2], []]) {
+    assert.throws(() => internals.mtfBinaryDecode(symbols, 3), ArchiveError);
+  }
+});
+
+test('adaptive arithmetic streams restore exact symbols and enforce canonical termination', () => {
+  for (const width of [8, 9]) for (const contextual of [false, true]) {
+    for (const size of [0, 1, 2, 31, 1009, 16387]) {
+      const symbols = Uint16Array.from(randomBytes(size, size + width), (byte, i) => width === 9 && i % 7 === 0 ? 256 : byte);
+      const encoded = internals.arithmeticEncode(symbols, width, contextual);
+      assert.deepEqual(internals.arithmeticDecode(encoded, size, width, contextual), symbols);
+      assert.throws(() => internals.arithmeticDecode(encoded.subarray(0, -1), size, width, contextual), ArchiveError);
+      assert.throws(() => internals.arithmeticDecode(Buffer.concat([encoded, Buffer.from([0])]), size, width, contextual), ArchiveError);
+    }
+  }
+});
+
+test('all adaptive BWT block modes validate headers, corruption and truncation', () => {
+  const input = Buffer.from('Adaptive contexts preserve bytes: banana bandana! 0123456789. '.repeat(45));
+  const bwt = internals.bwtEncode(input);
+  for (const mode of [3, 4, 5]) {
+    const symbols = mode === 3 ? internals.mtfRunsEncode(bwt.data) : internals.mtfBinaryEncode(bwt.data);
+    const data = internals.arithmeticEncode(symbols, mode === 3 ? 8 : 9, mode !== 5);
+    const prefix = Buffer.concat([varUint(128 * 1024), varUint(1), Buffer.from([mode]), varUint(input.length), varUint(bwt.primary), varUint(symbols.length), varUint(data.length)]);
+    const archive = record(13, input, Buffer.concat([prefix, data]));
+    assert.deepEqual(decompress(archive), input);
+    for (let i = 0; i < data.length; i++) {
+      const corrupt = Buffer.from(data);
+      corrupt[i] ^= 0x80;
+      assert.throws(() => decompress(record(13, input, Buffer.concat([prefix, corrupt]))), ArchiveError, `mode ${mode}, byte ${i}`);
+    }
+    assert.throws(() => decompress(archive.subarray(0, -1)), ArchiveError);
+    assert.throws(() => decompress(Buffer.concat([archive, Buffer.from([0])])), ArchiveError);
+    const badCount = Buffer.concat([varUint(128 * 1024), varUint(1), Buffer.from([mode]), varUint(input.length), varUint(bwt.primary), varUint(input.length * 3), varUint(data.length), data]);
+    assert.throws(() => decompress(record(13, input, badCount)), ArchiveError);
+  }
+});
+
+test('adaptive BWT improves every varied text fixture over the previous codec', () => {
+  const limits = { 'english-varied-240k': 26000, 'russian-numbered': 11000, 'csv-varied': 47000, 'json-varied': 29000 };
+  for (const [name, input] of compressionFixtures()) {
+    if (!limits[name]) continue;
+    const archive = compress(input);
+    assert.ok(archive.length < limits[name], `${name}: ${archive.length}`);
+    assert.deepEqual(decompress(archive), input, name);
+  }
+});
+
+test('adaptive context blocks round-trip mixed blocks, many alphabets and UTF-8 text', () => {
+  const input = Buffer.concat([
+    randomBytes(32 * 1024, 121),
+    Buffer.from('Точный UTF-8: 日本語, العربية, Ελληνικά, emoji 🙂.\r\n'.repeat(1000)),
+    Buffer.from('function encode(data) { return data.map(value => value + 1); }\n'.repeat(500)),
+    randomBytes(619, 672)
+  ]);
+  const encoded = internals.contextBlocksEncode(input, 32 * 1024, true);
+  assert.deepEqual(internals.contextBlocksDecode(encoded, input.length), input);
+  for (let seed = 1; seed <= 30; seed++) {
+    const data = randomBytes(111 + seed * 103, seed * 9871);
+    for (let i = 0; i < data.length; i++) data[i] %= seed % 3 ? seed % 17 + 1 : 256;
+    const payload = internals.contextBlocksEncode(data, 128 * 1024, true);
+    assert.deepEqual(decompress(record(13, data, payload)), data, `seed ${seed}`);
+  }
+});
+
+test('short English and highly repetitive numbered Russian text also use context candidates', () => {
+  const short = Buffer.from('A lossless archive preserves every byte. Select your files, compress them, and download the result. The decoder restores the original bytes using the dictionary stored in the archive. No external data is required.');
+  const repeated = Buffer.from(Array.from({ length: 300 }, (_, i) => `Архиватор сохраняет данные без потерь. Проверка целостности защищает исходные файлы. Запись ${i}.\n`).join(''));
+  for (const input of [short, repeated]) assert.deepEqual(decompress(compress(input)), input);
+  assert.ok(compress(short).length < 172);
+});
+
 test('context blocks preserve mixed raw and compressed blocks across boundaries', () => {
   const input = Buffer.concat([
     randomBytes(128 * 1024),
